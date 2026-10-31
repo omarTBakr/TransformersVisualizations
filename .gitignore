@@ -1,0 +1,15 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.mypy_cache/
+
+# Virtual environments
+.venv
+
+# The paper PDF and the base64 copy generated from it (local use only; not redistributable)
+**/ui/*.pdf
+**/ui/paper.local.js

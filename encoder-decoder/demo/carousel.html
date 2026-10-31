@@ -1,0 +1,77 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Transformers Visualizations carousel</title>
+<style>
+  @page { size: 1080px 1350px; margin: 0; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body { font-family: "Liberation Sans", "Noto Sans", Arial, sans-serif; color: #e6e8eb; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .page { width: 1080px; height: 1350px; padding: 72px 64px; background: radial-gradient(circle at 20% 10%, #1f2b44 0%, #15171b 60%);
+          display: flex; flex-direction: column; page-break-after: always; break-after: page; overflow: hidden; position: relative; }
+  .kicker { color: #6aa0ff; font-size: 24px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+  h1 { font-size: 78px; line-height: 1.04; margin: 14px 0 20px; letter-spacing: -0.02em; }
+  h2 { font-size: 58px; line-height: 1.08; margin: 12px 0 30px; }
+  em { font-style: normal; color: #6aa0ff; }
+  p.lead { font-size: 30px; line-height: 1.4; color: #b8bec8; margin: 0 0 34px; }
+  .shot { border-radius: 18px; border: 2px solid #353a42; box-shadow: 0 20px 60px rgba(0,0,0,.45); overflow: hidden; background: #1d2025; }
+  .shot img { display: block; width: 100%; }
+  .crop { height: 100%; width: 100%; background-repeat: no-repeat; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 26px; flex: 1; }
+  .tile { display: flex; flex-direction: column; gap: 12px; }
+  .tile .shot { flex: 1; min-height: 0; }
+  .tile b { font-size: 27px; } .tile span { font-size: 21px; color: #b8bec8; line-height: 1.35; }
+  ul { list-style: none; padding: 0; margin: 0 0 30px; display: flex; flex-direction: column; gap: 22px; }
+  li { font-size: 30px; line-height: 1.35; padding-left: 52px; position: relative; color: #d7dbe1; }
+  li::before { content: ""; position: absolute; left: 0; top: 6px; width: 30px; height: 30px; border-radius: 8px; background: #6aa0ff; opacity: .9; }
+  li b { color: #fff; }
+  .cta { margin-top: auto; border: 2px solid #3fd0a4; border-radius: 18px; padding: 26px 30px; background: rgba(63,208,164,.08); }
+  .cta .mono { font-family: "Liberation Mono", "DejaVu Sans Mono", monospace; font-size: 30px; color: #3fd0a4; }
+  .cta p { font-size: 24px; color: #b8bec8; margin: 10px 0 0; }
+  .num { position: absolute; right: 64px; top: 72px; font-size: 22px; color: #7d8590; font-weight: 700; }
+  .swipe { margin-top: auto; font-size: 26px; color: #6aa0ff; font-weight: 700; }
+</style></head>
+<body>
+  <!-- 1: hook -->
+  <section class="page">
+    <div class="num">1 / 3</div>
+    <div class="kicker">Transformers Visualizations</div>
+    <h1>See <em>every number</em> inside a Transformer</h1>
+    <p class="lead">An interactive walkthrough of a real PyTorch encoder–decoder forward pass: one tensor operation at a time, linked to the exact line of code that runs it.</p>
+    <div class="shot"><img src="screenshots/04-matmul.png" alt="Matrix multiplication breakdown"></div>
+    <div class="swipe">Swipe →</div>
+  </section>
+
+  <!-- 2: features -->
+  <section class="page">
+    <div class="num">2 / 3</div>
+    <div class="kicker">What you can explore</div>
+    <h2>Every step, <em>worked out</em></h2>
+    <div class="grid">
+      <div class="tile"><div class="shot"><div class="crop" style="background-image:url(screenshots/04-matmul.png);background-size:250%;background-position:36% 53%"></div></div>
+        <b>Matmul, cell by cell</b><span>Click any result: its row × column lights up and the dot product is checked against the model.</span></div>
+      <div class="tile"><div class="shot"><div class="crop" style="background-image:url(screenshots/06-softmax.png);background-size:250%;background-position:36% 55%"></div></div>
+        <b>LaTeX arithmetic</b><span>Softmax, LayerNorm and positional encoding written out with the real values.</span></div>
+      <div class="tile"><div class="shot"><div class="crop" style="background-image:url(screenshots/08-relu.png);background-size:200%;background-position:34% 50%"></div></div>
+        <b>Special values flagged</b><span>ReLU zeros, the row max, −∞ masks and padding, highlighted where they happen.</span></div>
+      <div class="tile"><div class="shot"><div class="crop" style="background-image:url(screenshots/12-read-the-code.png);background-size:250%;background-position:95% 41%"></div></div>
+        <b>Code in sync</b><span>Each stage outlines the line that runs it, plus implementation details not in the paper.</span></div>
+    </div>
+  </section>
+
+  <!-- 3: how it's built + CTA -->
+  <section class="page">
+    <div class="num">3 / 3</div>
+    <div class="kicker">Built for learning</div>
+    <h2>Small enough to <em>check by hand</em></h2>
+    <ul>
+      <li><b>Three model sizes:</b> Tiny 3×3 (every value on screen), Small 9×9 (3 heads, 2 + 2 layers), and the full config.</li>
+      <li><b>Real execution trace:</b> captured from the PyTorch model with hooks and sys.settrace; nothing is hand-drawn.</li>
+      <li><b>Isometric tensors</b> with the batch, sequence and feature axes named, plus "all at once" notes on parallelism.</li>
+      <li><b>Dockable workspace:</b> drag, dock and collapse panels; architecture diagram, code and paper notes stay linked.</li>
+    </ul>
+    <div class="shot" style="max-height:300px"><img src="screenshots/09-small-heads.png" alt="Small preset with three heads"></div>
+    <div class="cta">
+      <div class="mono">github.com/omarTBakr/TransformersVisualizations</div>
+      <p>Open source. Next: decoder-only (GPT-style) and encoder-only (BERT-style).</p>
+    </div>
+  </section>
+</body></html>

@@ -1,0 +1,119 @@
+# ==============================================================================
+# Transformer Model Configuration
+# ==============================================================================
+
+model:
+  name: "transformer"
+  
+  # Vocabulary & Token parameters
+  vocab_size: 32000               # Vocabulary size (or shared vocab size)
+  src_vocab_size: 32000           # Source vocabulary size (for translation/seq2seq)
+  tgt_vocab_size: 32000           # Target vocabulary size (for translation/seq2seq)
+  
+  # Architecture dimensions
+  d_model: 512                    # Embedding and hidden dimension (e.g., 512 base, 1024 large)
+  n_heads: 8                      # Number of attention heads (d_model must be divisible by n_heads)
+  n_encoder_layers: 6             # Number of encoder layers
+  n_decoder_layers: 6             # Number of decoder layers
+  d_ff: 2048                      # Dimension of feed-forward network (usually 4 * d_model)
+  
+  # Regularization & Activation
+  dropout: 0.1                    # Dropout probability for attention and feed-forward
+  activation: "relu"              # Activation function: "relu", "gelu", "silu"
+  layer_norm_eps: 1.0e-5          # Epsilon for Layer Normalization
+  bias: true                      # Whether to include bias terms in linear layers
+  
+  # Sequence & Positional Encoding
+  max_seq_len: 512                # Maximum sequence length / context window
+  positional_encoding: "sinusoidal" # Options: "sinusoidal", "learned"
+  share_embeddings: true          # Share input embeddings with output projection
+
+# ==============================================================================
+# Training Parameters
+# ==============================================================================
+training:
+  batch_size: 64
+  num_epochs: 30
+  seed: 42
+  
+  # Optimization
+  optimizer:
+    name: "adamw"                 # "adam", "adamw", "sgd"
+    lr: 1.0e-4
+    betas: [0.9, 0.98]            # Standard Adam betas for Transformers
+    eps: 1.0e-9
+    weight_decay: 0.01
+  
+  # Learning Rate Scheduler
+  scheduler:
+    name: "warmup_cosine"         # Options: "noam", "warmup_cosine", "linear", "step"
+    warmup_steps: 4000
+    min_lr: 1.0e-6
+  
+  # Loss & Regularization
+  loss:
+    label_smoothing: 0.1          # Label smoothing factor for cross entropy
+  
+  # Training utilities
+  grad_clip: 1.0                  # Maximum gradient norm for clipping
+  gradient_accumulation_steps: 1  # Accumulate gradients over N batches
+  mixed_precision: "fp16"         # Precision mode: "no", "fp16", or "bf16"
+
+# ==============================================================================
+# Dataset & Data Loading
+# ==============================================================================
+data:
+  dataset_name: "custom"
+  train_path: "data/train.jsonl"
+  val_path: "data/val.jsonl"
+  test_path: "data/test.jsonl"
+  src_lang: "en"
+  tgt_lang: "de"
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+# ==============================================================================
+# Tokenizer Configuration
+# ==============================================================================
+tokenizer:
+  type: "bpe"                     # Options: "bpe", "wordpiece", "sentencepiece", "huggingface"
+  vocab_path: "tokenizer/vocab.json"
+  pad_token: "<pad>"
+  pad_token_id: 0
+  unk_token: "<unk>"
+  unk_token_id: 1
+  bos_token: "<s>"
+  bos_token_id: 2
+  eos_token: "</s>"
+  eos_token_id: 3
+
+# ==============================================================================
+# Generation / Inference Parameters
+# ==============================================================================
+inference:
+  decoding_strategy: "beam_search" # Options: "greedy", "beam_search", "top_k", "top_p"
+  beam_size: 4
+  max_length: 128
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.95
+  repetition_penalty: 1.0
+
+# ==============================================================================
+# System, Logging & Checkpointing
+# ==============================================================================
+system:
+  device: "cuda"                  # "cuda", "cpu", or "auto"
+  checkpoint_dir: "checkpoints"
+  save_every_epochs: 1
+  keep_best_n_checkpoints: 3
+  log_interval: 100               # Log training status every N steps
+  eval_interval: 500              # Evaluate on validation set every N steps
+  
+  # Logging integration
+  logging:
+    use_tensorboard: true
+    use_wandb: false
+    wandb_project: "transformer-training"
+
