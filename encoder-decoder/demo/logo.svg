@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 150" role="img" aria-label="Transformers Visualizations">
+  <defs>
+    <linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#6aa0ff"/><stop offset="1" stop-color="#3fd0a4"/></linearGradient>
+    <style>
+      .t{font:700 34px "Liberation Sans",Arial,sans-serif;fill:#6aa0ff}
+      .s{font:600 12.5px "Liberation Mono",monospace;fill:#8b93a0}
+      .cell{stroke:#15171b;stroke-width:1.2}
+      @keyframes pulse{0%,100%{opacity:.35}50%{opacity:1}}
+      .hi{animation:pulse 2.4s ease-in-out infinite}
+      .hi2{animation:pulse 2.4s ease-in-out infinite;animation-delay:.8s}
+      .hi3{animation:pulse 2.4s ease-in-out infinite;animation-delay:1.6s}
+    </style>
+  </defs>
+  <!-- isometric 3×3 tensor -->
+  <g transform="translate(18,34)">
+    <polygon points="0,0 72,0 92,-16 20,-16" fill="#3b5d9c" class="cell"/>
+    <polygon points="72,0 92,-16 92,56 72,72" fill="#2b4677" class="cell"/>
+    <rect x="0" y="0" width="24" height="24" fill="#d66e28" class="cell"/>
+    <rect x="24" y="0" width="24" height="24" fill="#6aa0ff" class="cell hi"/>
+    <rect x="48" y="0" width="24" height="24" fill="#2f6fde" class="cell"/>
+    <rect x="0" y="24" width="24" height="24" fill="#2f6fde" class="cell"/>
+    <rect x="24" y="24" width="24" height="24" fill="#f09650" class="cell hi2"/>
+    <rect x="48" y="24" width="24" height="24" fill="#d66e28" class="cell"/>
+    <rect x="0" y="48" width="24" height="24" fill="#f09650" class="cell"/>
+    <rect x="24" y="48" width="24" height="24" fill="#2f6fde" class="cell"/>
+    <rect x="48" y="48" width="24" height="24" fill="#6aa0ff" class="cell hi3"/>
+  </g>
+  <text x="130" y="62" class="t">Transformers</text>
+  <text x="130" y="100" class="t" style="fill:url(#g)">Visualizations</text>
+  <text x="130" y="128" class="s">every tensor · every number · every line</text>
+</svg>

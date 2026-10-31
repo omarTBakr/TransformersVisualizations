@@ -3,7 +3,7 @@ Regenerate the demo assets from the live app:
 
   demo/screenshots/*.png      feature screenshots (headless Chrome, 1920×1080)
   demo/linkedin-carousel.pdf  3-page LinkedIn document post (1080×1350)
-  demo/feature-tour.mp4       ~1-minute captioned tour of all features
+  demo/walkthrough.mp4        ~1-minute captioned tour of all features (+ walkthrough.gif for the README)
 
 Usage (from encoder-decoder/):
     uv run ui/build_ui.py          # make sure the page is up to date
@@ -121,8 +121,12 @@ def make_video(seconds: float = 4.2, fade: float = 0.6) -> None:
             last, offset = out, offset + dur - fade
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", ";".join(filt), "-map", last,
                         "-c:v", "libx264", "-crf", "20", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                        str(DEMO / "feature-tour.mp4")], check=True)
-    print("Video:\n  feature-tour.mp4")
+                        str(DEMO / "walkthrough.mp4")], check=True)
+    # GIF for the README (GitHub plays GIFs inline, not MP4s)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(DEMO / "walkthrough.mp4"), "-vf",
+                    "fps=6,scale=1100:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=160[p];[b][p]paletteuse=dither=sierra2_4a",
+                    str(DEMO / "walkthrough.gif")], check=True)
+    print("Video:\n  walkthrough.mp4\n  walkthrough.gif")
 
 
 if __name__ == "__main__":

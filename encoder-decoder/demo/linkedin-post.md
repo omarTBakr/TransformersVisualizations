@@ -1,6 +1,6 @@
 # Draft LinkedIn post
 
-Attach `linkedin-carousel.pdf` as a document post, or `feature-tour.mp4` as a video.
+Attach `linkedin-carousel.pdf` as a document post, or `walkthrough.mp4` as a video.
 
 ---
 
