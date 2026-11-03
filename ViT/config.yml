@@ -1,0 +1,90 @@
+# ==============================================================================
+# Transformer Model Configuration
+# ==============================================================================
+
+model:
+  name: "vit-base-16"
+
+  # Image → patches (ViT-Base/16 at 224×224, the paper's Table 1)
+  image_size: 224                 # square input images, in pixels
+  patch_size: 16                  # P: each patch is P × P pixels → N = (224 / 16)² = 196 patches
+  in_channels: 3                  # RGB
+  num_classes: 1000               # size of the classification head (e.g. ImageNet-1k)
+
+  # Transformer encoder
+  d_model: 768                    # D, the hidden size
+  n_heads: 12                     # d_model must be divisible by n_heads (d_k = 64)
+  n_encoder_layers: 12            # L
+  d_ff: 3072                      # MLP size (4 × D)
+
+  # Regularization & Activation
+  dropout: 0.1
+  activation: "gelu"              # the paper's MLP uses GELU
+  layer_norm_eps: 1.0e-6
+  bias: true
+
+  # Sequence & positional encoding
+  max_seq_len: 197                # N + 1: the 196 patches plus the [CLS] token
+  positional_encoding: "sinusoidal" # the paper learns its position embeddings; "learned" is also available
+
+# ==============================================================================
+# Training Parameters
+# ==============================================================================
+training:
+  # Pre-training recipe from the paper (§4.1, "Training & Fine-tuning")
+  batch_size: 4096
+  num_epochs: 300
+  seed: 42
+
+  # Optimization
+  optimizer:
+    name: "adam"                  # "adam", "adamw", "sgd"
+    lr: 1.0e-3
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+    weight_decay: 0.1             # "high weight decay of 0.1"
+
+  # Learning Rate Scheduler
+  scheduler:
+    name: "linear"                # linear warmup, then linear decay
+    warmup_steps: 10000
+    min_lr: 0.0
+
+  # Loss & Regularization
+  loss:
+    label_smoothing: 0.0
+
+  # Training utilities
+  grad_clip: 1.0                  # global gradient norm clipping at 1
+  gradient_accumulation_steps: 1
+  mixed_precision: "bf16"
+
+# ==============================================================================
+# Dataset & Data Loading
+# ==============================================================================
+data:
+  dataset_name: "imagenet-1k"
+  train_path: "data/train.jsonl"
+  val_path: "data/val.jsonl"
+  test_path: "data/test.jsonl"
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+# ==============================================================================
+# System, Logging & Checkpointing
+# ==============================================================================
+system:
+  device: "cuda"                  # "cuda", "cpu", or "auto"
+  checkpoint_dir: "checkpoints"
+  save_every_epochs: 1
+  keep_best_n_checkpoints: 3
+  log_interval: 100               # Log training status every N steps
+  eval_interval: 500              # Evaluate on validation set every N steps
+  
+  # Logging integration
+  logging:
+    use_tensorboard: true
+    use_wandb: false
+    wandb_project: "transformer-training"
+

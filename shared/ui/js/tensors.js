@@ -13,9 +13,10 @@
   function create(ctx) {
     const { B, word, esc } = ctx;
     const sample = () => ctx.sample();
-    const SRC_T = B.src[0].length, TGT_T = B.tgt[0].length;
-    const sideOfT = T => (T === SRC_T ? "src" : "tgt");
-    const idsOf = side => (side === "src" ? B.src : B.tgt);
+    // Encoder-only models (ViT) have a single sequence: `tgt` is absent.
+    const SRC_T = B.src[0].length, TGT_T = B.tgt ? B.tgt[0].length : -1;
+    const sideOfT = T => (T === SRC_T || !B.tgt ? "src" : "tgt");
+    const idsOf = side => (side === "src" || !B.tgt ? B.src : B.tgt);
     const short = w => (w.length > 6 ? w.slice(0, 5) + "…" : w);
     const NEG_INF = 1e29;
 
@@ -126,13 +127,16 @@
       return { w: Math.ceil(Math.max(right, titleR, axisR)), h: oy + H + 34, body };
     }
 
+    // Long sequences (ViT-Base: 197 tokens) are cut to their first positions; slice.T is the full length.
+    const seqName = (shown, full) => (full && full > shown ? `sequence · first ${shown} of T = ${full}` : `sequence · T = ${shown}`);
+
     // A cube from a simulator slice {v: [B][T][K], D, dims} (batch in depth, selected sample in front).
     function batchCube(slice, opts = {}) {
       const T = slice.v[0].length, side = sideOfT(T);
       return cube({
         v: slice.v, front: sample(), depthLabels: i => `sample ${i + 1}`, depthName: `batch · B = ${slice.v.length}`,
         xLabels: i => word(idsOf(side)[sample()][i], side), xPad: i => idsOf(side)[sample()][i] === B.pad,
-        xName: `sequence · T = ${T}`, yName: `features · ${slice.D}${opts.heads ? ` · ${opts.heads} heads` : ""}`, ...opts,
+        xName: seqName(T, slice.T), yName: `features · ${slice.D}${opts.heads ? ` · ${opts.heads} heads` : ""}`, ...opts,
       });
     }
 
@@ -263,7 +267,7 @@
     }
 
     return { heat, fmtNum, cube, batchCube, genericCube, grid, valueGrid, tokens, fromSlice, op, note, layout,
-             axisLabels, axisPad, sideOfT, idsOf, short, NEG_INF };
+             axisLabels, axisPad, sideOfT, idsOf, short, seqName, NEG_INF };
   }
 
   window.Tensors = { create };

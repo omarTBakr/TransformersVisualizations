@@ -13,6 +13,8 @@ Entry fields:
   code   – how this repository relates to the paper for this part
 """
 
+from pathlib import Path
+
 PAPER_TITLE = "Attention Is All You Need (Vaswani et al., 2017)"
 PAPER_URL = "https://ar5iv.labs.arxiv.org/html/1706.03762"
 PAPER_PDF = "https://arxiv.org/pdf/1706.03762"
@@ -448,7 +450,7 @@ def paper_data(settings) -> dict:
 
     from paper_pdf import open_paper  # noqa: E402
 
-    local = _attach_pdf(entries, open_paper())
+    local = _attach_pdf(entries, open_paper(Path(__file__).resolve().parent, "attention"))
     return {
         "title": PAPER_TITLE, "url": PAPER_URL, "pdf": PAPER_PDF, "entries": entries,
         "citation": CITATION, "notice": GOOGLE_NOTICE, "disclaimer": DISCLAIMER,

@@ -1,6 +1,7 @@
 """
 Generate ui/architecture.html: an interactive Transformer diagram in which every block
-links to the file / class in this repo that implements it.
+links to the file / class in this repo that implements it, plus a step-by-step trace of a
+real forward pass. The page shell and the generic code live in ../shared (see shared/py/build.py).
 
 Usage:
     .venv/bin/python ui/build_ui.py
@@ -8,30 +9,22 @@ Usage:
 Re-run after changing the code so the page shows the current source.
 """
 
-import ast
-import json
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = Path(__file__).resolve().parent
-TEMPLATE = UI_DIR / "template.html"
-OUTPUT = UI_DIR / "architecture.html"
-PLACEHOLDER = "/*__DATA__*/null"
 
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(UI_DIR))
+sys.path.insert(0, str(ROOT.parent / "shared" / "py"))
 from config import Settings  # noqa: E402
+from build import Component, components_and_files, check, write_page  # noqa: E402
 
-
-@dataclass
-class Component:
-    id: str
-    label: str
-    kind: str  # embed | pe | attn | ffn | norm | linear | softmax | stack | misc
-    note: str
-    refs: list[tuple[str, str | None]] = field(default_factory=list)  # (file, symbol)
+TITLE = "Transformer Architecture Map"
+# Wording the shared stage engine uses for this model's output.
+SPEC = {"out_axis": "vocabulary", "out_item": "next word", "top_label": "most likely next words",
+        "top_title": "next-token probabilities"}
 
 
 # ----------------------------------------------------------------------------------
@@ -115,88 +108,14 @@ COMPONENTS: list[Component] = [
 ]
 
 
-def find_symbol(tree: ast.Module, qualname: str) -> ast.AST:
-    """Locate a class / function (optionally Class.method) in a parsed module."""
-    node: ast.AST = tree
-    for part in qualname.split("."):
-        body = getattr(node, "body", [])
-        match = next(
-            (n for n in body
-             if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-             and n.name == part),
-            None,
-        )
-        if match is None:
-            raise LookupError(qualname)
-        node = match
-    return node
-
-
-def resolve(file: str, symbol: str | None, cache: dict) -> dict:
-    path = ROOT / file
-    if not path.exists():
-        raise SystemExit(f"[build_ui] File not found: {file}")
-    text = cache.setdefault(file, path.read_text(encoding="utf-8"))
-    lines = text.splitlines()
-
-    if symbol is None:
-        start, end = 1, len(lines)
-    else:
-        if not file.endswith(".py"):
-            raise SystemExit(f"[build_ui] Symbols are only supported for .py files: {file}")
-        try:
-            node = find_symbol(ast.parse(text, filename=file), symbol)
-        except LookupError:
-            raise SystemExit(
-                f"[build_ui] '{symbol}' not found in {file}. "
-                "Update COMPONENTS in ui/build_ui.py to match the code."
-            ) from None
-        # Include decorators, if any.
-        decos = getattr(node, "decorator_list", [])
-        start = min([node.lineno] + [d.lineno for d in decos])
-        end = node.end_lineno
-
-    return {
-        "file": file,
-        "symbol": symbol,
-        "start": start,
-        "end": end,
-        "code": "\n".join(lines[start - 1 : end]),
-    }
-
-
 def main() -> None:
     settings = Settings.from_yaml(ROOT / "config.yml")
     m = settings.model
-
-    cache: dict[str, str] = {}
-    components = {}
-    for c in COMPONENTS:
-        components[c.id] = {
-            "label": c.label,
-            "kind": c.kind,
-            "note": c.note,
-            "refs": [resolve(f, s, cache) for f, s in c.refs],
-        }
-
-    # Reverse mapping: every project source file -> the blocks it implements.
-    project_files = sorted(p.name for p in ROOT.glob("*.py")) + ["config.yml"]
-    files = {}
-    for name in project_files:
-        text = cache.get(name) or (ROOT / name).read_text(encoding="utf-8")
-        files[name] = {
-            "code": text,
-            "lines": len(text.splitlines()),
-            "blocks": [cid for cid, c in components.items()
-                       if any(r["file"] == name for r in c["refs"])],
-        }
+    components, files = components_and_files(ROOT, COMPONENTS)
 
     from simulate import simulate  # noqa: E402  (needs sys.path set above)
-
     from paper import paper_data  # noqa: E402
-
     from impl_notes import resolve_notes  # noqa: E402
-
     from presets import PRESETS, build_settings  # noqa: E402
 
     def cfg_dict(mm) -> dict:
@@ -211,44 +130,20 @@ def main() -> None:
         sims[pr.name] = simulate(ps, pr.src, pr.tgt, detail=pr.detail, src_bos=pr.src_bos)
         configs[pr.name] = cfg_dict(ps.model)
         preset_info.append({"name": pr.name, "label": pr.label, "blurb": pr.blurb, "detail": pr.detail})
-    sim = sims["full"]
-    paper = paper_data(settings)
-    impl = resolve_notes(m.d_model)
-    known = {c.id for c in COMPONENTS} | {s["key"] for s in sim["steps"]}
-    bad = sorted({c for n in impl for c in n["comps"] if c not in known})
-    if bad:
-        raise SystemExit(f"[build_ui] Implementation notes reference unknown components: {bad}")
-    missing = [c.id for c in COMPONENTS if c.id not in paper["entries"]]
-    if missing:
-        raise SystemExit(f"[build_ui] No paper entry for components: {missing} (see ui/paper.py)")
 
     data = {
         "sims": sims,
         "configs": configs,
         "presets": preset_info,
-        "paper": paper,
-        "impl": impl,
+        "paper": paper_data(settings),
+        "impl": resolve_notes(m.d_model),
         "config": configs["full"],
         "components": components,
         "files": files,
+        "spec": SPEC,
     }
-
-    # The page loads these with relative <script src> tags (works from file:// too).
-    missing_js = [f for f in ("js/dock.js", "js/tensors.js", "js/stage.js") if not (UI_DIR / f).exists()]
-    if missing_js:
-        raise SystemExit(f"[build_ui] Missing UI scripts: {missing_js}")
-
-    template = TEMPLATE.read_text(encoding="utf-8")
-    # Cache-bust the local scripts so a rebuilt page never runs a stale copy from the browser cache.
-    import hashlib  # noqa: E402
-    for js in ("js/dock.js", "js/tensors.js", "js/stage.js"):
-        ver = hashlib.md5((UI_DIR / js).read_bytes()).hexdigest()[:8]
-        template = template.replace(f'src="{js}"', f'src="{js}?v={ver}"')
-    if PLACEHOLDER not in template:
-        raise SystemExit(f"[build_ui] Placeholder {PLACEHOLDER!r} missing from template.html")
-    # Escape "</" so embedded source can never close the <script> tag.
-    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    OUTPUT.write_text(template.replace(PLACEHOLDER, payload), encoding="utf-8")
+    check(data, COMPONENTS)
+    out = write_page(UI_DIR, data, TITLE)
 
     for cid, c in components.items():
         refs = ", ".join(f"{r['file']}:{r['start']}-{r['end']}" for r in c["refs"])
@@ -257,8 +152,8 @@ def main() -> None:
         c = configs[name]
         print(f"\nPreset {name:5}: d_model {c['d_model']}, heads {c['n_heads']}, layers {c['n_encoder_layers']}+{c['n_decoder_layers']}"
               f" → {len(sm['steps'])} steps")
-    print(f"Pinned {len(impl)} implementation notes (details not in the paper)")
-    print(f"Wrote {OUTPUT.relative_to(ROOT)}")
+    print(f"Pinned {len(data['impl'])} implementation notes (details not in the paper)")
+    print(f"Wrote {out.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

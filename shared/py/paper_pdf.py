@@ -14,8 +14,6 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-UI_DIR = Path(__file__).resolve().parent
-
 _WORD_RE = re.compile(
     r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">(.*?)</word>'
 )
@@ -106,29 +104,30 @@ class PaperPDF:
         return {p: [w, h] for p, (w, h) in self.page_size.items()}
 
 
-LOCAL_JS = UI_DIR / "paper.local.js"
-
-
-def write_local_js(pdf: Path | None) -> None:
+def write_local_js(ui_dir: Path, pdf: Path | None) -> None:
     """
-    Embed the PDF as base64 in ui/paper.local.js so the viewer works when architecture.html
+    Embed the PDF as base64 in <model>/ui/paper.local.js so the viewer works when architecture.html
     is opened straight from disk (file://), where browsers block reading local files.
     The file is git-ignored: it's a copy of the paper and must not be redistributed.
     """
+    local_js = ui_dir / "paper.local.js"
     if pdf is None:
-        LOCAL_JS.unlink(missing_ok=True)  # don't leave a stale copy behind
+        local_js.unlink(missing_ok=True)  # don't leave a stale copy behind
         return
-    if LOCAL_JS.exists() and LOCAL_JS.stat().st_mtime >= pdf.stat().st_mtime:
-        return  # already up to date
+    stamp = f"/* {pdf.name} - {pdf.stat().st_size} bytes */"
+    if local_js.exists():
+        with local_js.open(encoding="utf-8", errors="replace") as f:
+            if f.readline().strip() == stamp:
+                return  # already this PDF (a copy of another paper is replaced)
     encoded = base64.b64encode(pdf.read_bytes()).decode("ascii")
-    LOCAL_JS.write_text(f'window.PAPER_PDF_B64 = "{encoded}";\n', encoding="ascii")
+    local_js.write_text(f'{stamp}\nwindow.PAPER_PDF_B64 = "{encoded}";\n', encoding="utf-8")
 
 
-def open_paper() -> PaperPDF | None:
-    """Find the paper PDF in ui/ and parse it, or return None if unavailable."""
-    candidates = sorted(UI_DIR.glob("*.pdf"))
-    pdf = next((p for p in candidates if "attention" in p.name.lower()), candidates[0] if candidates else None)
-    write_local_js(pdf)
+def open_paper(ui_dir: Path, hint: str) -> PaperPDF | None:
+    """Find the paper PDF in <model>/ui/ (preferring a name containing `hint`) and parse it."""
+    candidates = sorted(ui_dir.glob("*.pdf"))
+    pdf = next((p for p in candidates if hint in p.name.lower()), candidates[0] if candidates else None)
+    write_local_js(ui_dir, pdf)
     if not shutil.which("pdftotext"):
         print("[build_ui] poppler-utils not found: paper viewer disabled.")
         return None

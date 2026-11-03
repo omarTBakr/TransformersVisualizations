@@ -1,7 +1,7 @@
 /*
- * Operation stage: explains the operation running at the current step.
+ * Operation stage (shared by every model): explains the operation running at the current step.
  *
- *   breadcrumb   tokens › Embedding › PE › Enc ‹2/6› [MHA · A&N · FFN · A&N] › … › Softmax
+ *   breadcrumb   the model's steps, with the running one lit (rows / groups come from the model)
  *   header       the operation name, centred
  *   tracking     the tensors in play (X, or Q / K / V for attention)
  *   visual       operands → operator → result, as isometrics with the real values
@@ -9,16 +9,24 @@
  *   stages       ‹ 3 / 6 › title + one-sentence "how"
  *
  * Each stage maps to a simulator sub-step, so the code panel outlines the matching line.
- * Depends on window.App (template.html) and window.Tensors (tensors.js).
+ *
+ * This file holds the engine and the builders every Transformer shares (attention, LayerNorm,
+ * feed-forward, softmax, matmul / linear views). A model adds its own steps (embeddings, masks,
+ * patches, heads…) and its breadcrumb in js/stage-model.js, which defines
+ *
+ *   window.StageModel = api => ({ build(st), crumbs: {short, rows}, parallel(st) })
+ *
+ * Depends on window.App (template.html), window.Tensors (tensors.js) and window.StageModel.
  */
 (function () {
   "use strict";
   const App = window.App;
   const root = document.getElementById("stageRoot");
-  if (!App || !root || !window.Tensors) return;
+  if (!App || !root || !window.Tensors || !window.StageModel) return;
 
   const { STEPS, B, cfg } = App;
   const { esc, fmt, word } = App.helpers;
+  const SPEC = App.DATA.spec || {};
   const T = Tensors.create({ B, word, esc, sample: () => App.state().sample });
   const d = cfg.d_model, h = cfg.n_heads, dk = d / h;
   const sample = () => App.state().sample;
@@ -41,7 +49,7 @@
       v: s.v, front: opts.single ? 0 : sample(), depthLabels: i => `sample ${(opts.single ? sample() : i) + 1}`,
       depthName: opts.single ? "" : `batch · B = ${slice.v.length}`,
       xLabels: i => words(side)[i], xPad: i => T.idsOf(side)[sample()][i] === B.pad,
-      xName: `sequence · T = ${slice.v[0].length}`, yName: `features · ${slice.D}`, ...opts,
+      xName: T.seqName(slice.v[0].length, slice.T), yName: `features · ${slice.D}`, ...opts,
     });
   }
   // Sub-step slice → drawing (3-D batch slices become cubes, 4-D become per-head cubes, 2-D grids).
@@ -69,78 +77,8 @@
   }
   const eqTerm = (id, html) => `<span class="term" data-term="${id}">${html}</span>`;
 
-  // Positional-encoding values for the sampled dims, from the paper's formula.
-  function peSlice(xs) {
-    const v = xs.v.map(seq => seq.map((_, pos) => xs.dims.map(dim => {
-      const i2 = dim - (dim % 2);
-      const ang = pos / Math.pow(10000, i2 / d);
-      return dim % 2 ? Math.cos(ang) : Math.sin(ang);
-    })));
-    return { v, D: xs.D, dims: xs.dims };
-  }
 
-  // ---------------------------------------------------------------- stage builders
-  function embeddingStages(st) {
-    const side = st.key === "input_embedding" ? "src" : "tgt";
-    const look = subIdx(st, byLabel(/^Embedding lookup/)), scale = subIdx(st, byLabel(/^Scale by/));
-    const lookV = st.subs[look] && st.subs[look].vals;
-    const stages = [{
-      title: "Token ids", term: "tok", sub: null,
-      how: "The tokenizer turned each word into an id (a toy word-level vocabulary here).",
-      parts: () => [T.tokens(side)],
-    }];
-    words(side).forEach((w, t) => stages.push({
-      title: `Look up “${w}”`, term: "e", sub: look,
-      how: `Row ${T.idsOf(side)[sample()][t]} of the ${side === "src" ? cfg.src_vocab_size : cfg.tgt_vocab_size} × ${d} table becomes the vector for position ${t}.`,
-      parts: () => [lookV ? cubeOf({ v: lookV.v, D: lookV.full[2] }, { single: true, hiCols: new Set([t]), title: "E[token]" }) : shapeOnly(st.out_shape, "lookup")],
-    }));
-    stages.push({
-      title: `Scale by √${d}`, term: "s", sub: scale,
-      how: `Every value is multiplied by √${d} ≈ ${Math.sqrt(d).toFixed(1)}, so embeddings and positional encodings have similar sizes.`,
-      parts: () => [subPart(st, look, { single: true, title: "E[token]" }), T.op(`× ${Math.sqrt(d).toFixed(1)}`, `√${d}`), cubeOf(st.out_vals, { single: true, title: "X" })],
-    });
-    return {
-      title: `${side === "src" ? "Input" : "Output"} Embedding`,
-      eq: `X = ${eqTerm("e", "E[token]")} · ${eqTerm("s", `√d<sub>model</sub>`)} ${eqTerm("tok", "")}`,
-      stages,
-    };
-  }
-
-  function peStages(st) {
-    const add = subIdx(st, byLabel(/positional encoding/));
-    const X = st.in_vals, Y = st.out_vals;
-    const P = X ? peSlice(X) : null;
-    const side = X ? T.sideOfT(X.v[0].length) : "src";
-    const stages = [{
-      title: "X + PE = Y", term: "all", sub: add,
-      how: "PE doesn't depend on the words, only on the position, so the same table is added to every sample.",
-      parts: () => [cubeOf(X, { single: true, title: "X (embeddings)", cw: 20 }), T.op("+"), cubeOf(P, { single: true, title: "PE (sin / cos)", cw: 20 }),
-                    T.op("="), cubeOf(Y, { single: true, title: "Y", cw: 20 })],
-    }];
-    if (X && Y) words(side).forEach((w, t) => stages.push({
-      title: `Position ${t}: “${w}”`, term: "pe", sub: add,
-      how: `Column ${t} of PE is added to column ${t} of X. Even dims use sin, odd dims use cos.`,
-      parts: () => {
-        const s = sample(), hi = new Set([t]);
-        const cell = k => `dim ${X.dims[k]} (${X.dims[k] % 2 ? "cos" : "sin"}): ${nf(X.v[s][t][k])} + ${nf(P.v[s][t][k])} = ${nf(Y.v[s][t][k])}`;
-        return [cubeOf(X, { single: true, hiCols: hi, title: "X", cw: 20 }), T.op("+"), cubeOf(P, { single: true, hiCols: hi, title: "PE", cw: 20 }),
-                T.op("="), cubeOf(Y, { single: true, hiCols: hi, title: "Y", cw: 20 }), T.note([cell(0), cell(1)], { w: 290 })];
-      },
-    }));
-    stages.push({
-      title: "Y feeds Q, K and V", term: "y", sub: add,
-      how: "The next block projects this same tensor three times: queries, keys and values all start from Y.",
-      parts: () => [cubeOf(Y, { title: "Y" }), T.op("→"), T.note(["Q = Y·W_Q", "K = Y·W_K", "V = Y·W_V"], { w: 140 })],
-    });
-    return {
-      title: "Positional Encoding",
-      eq: `${eqTerm("y", "Y")} = ${eqTerm("x", "X")} + ${eqTerm("pe", "PE")}<br>
-           PE<sub>(pos, 2i)</sub> = sin(pos / 10000<sup>2i/d</sup>) &nbsp;·&nbsp; PE<sub>(pos, 2i+1)</sub> = cos(pos / 10000<sup>2i/d</sup>)
-           ${eqTerm("all", "")}`,
-      stages,
-    };
-  }
-
+  // ---------------------------------------------------------------- shared stage builders
   function attentionStages(st) {
     const cross = st.key === "dec_cross_attn", masked = st.key === "dec_masked_attn";
     const qp = subIdx(st, byVar("q_proj")), kp = subIdx(st, byVar("k_proj")), vp = subIdx(st, byVar("v_proj"));
@@ -194,9 +132,11 @@
     };
   }
 
+  // Post-norm models (the original Transformer) record a "Residual add" sub-step inside the
+  // LayerNorm step; pre-norm models (ViT) normalize the plain input and add the residual later.
   function normStages(st) {
     const final = st.key.endsWith("final");
-    const res = subIdx(st, byLabel(/^Residual add/)), mu = subIdx(st, byLabel(/^Mean/)), va = subIdx(st, byLabel(/^Variance/));
+    const res = subIdx(st, byLabel(/^Residual add/)), xn = res >= 0 ? "x'" : "x", mu = subIdx(st, byLabel(/^Mean/)), va = subIdx(st, byLabel(/^Variance/));
     const nz = subIdx(st, byLabel(/^Normalize/)), sc = subIdx(st, byLabel(/^Scale and shift/));
     const xs = st.subs[res] && st.subs[res].vals ? st.subs[res].vals : null;
     const side = st.out_vals ? T.sideOfT(st.out_vals.v[0].length) : "src";
@@ -209,36 +149,52 @@
         parts: () => [T.genericCube({ T: 6, K: 10, Dn: 2, xName: "sequence · T", yName: `features · d_model = ${d}`, depthName: "batch · B", hiCols: new Set([2]), title: "one highlighted fibre = one (b, t)" }),
                       T.note(["μ and σ² are taken", "along the feature axis", "of each fibre"], { w: 170 })] },
     ];
-    if (!final) stages.push({ title: "Residual add", term: "res", sub: res,
+    if (res >= 0) stages.push({ title: "Residual add", term: "res", sub: res,
       how: "The sub-layer's output is added back to its input (the skip connection).",
       parts: () => [cubeOf(xSlice, { single: true, title: "x' = x + Sublayer(x)" })] });
     stages.push({ title: `Mean μ of “${words(side)[t]}”`, term: "mu", sub: mu,
       how: `Average the ${d} features of this position.`,
-      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: "x'" }), T.op("mean", "over features"),
+      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: xn }), T.op("mean", "over features"),
                     T.note([`μ = ${val(mu) != null ? nf(val(mu)) : "…"}`], { w: 120 })] });
     stages.push({ title: "Variance σ²", term: "var", sub: va,
       how: "Average squared distance from μ, over the same fibre.",
-      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: "x'" }), T.op("var", "over features"),
+      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: xn }), T.op("var", "over features"),
                     T.note([`σ² = ${val(va) != null ? nf(val(va)) : "…"}`], { w: 120 })] });
     stages.push({ title: "Normalize", term: "norm", sub: nz,
       how: "Subtract μ and divide by √(σ² + ε): every fibre now has mean 0 and variance 1.",
-      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: "x'" }), T.op("(x−μ)/σ"),
+      parts: () => [cubeOf(xSlice, { single: true, hiCols: new Set([t]), title: xn }), T.op("(x−μ)/σ"),
                     subPart(st, nz, { single: true, hiCols: new Set([t]), title: "x̂" })] });
     stages.push({ title: "Scale γ and shift β", term: "gb", sub: sc,
       how: "Learned per-feature γ and β let the model undo the normalization where useful.",
       parts: () => [subPart(st, nz, { single: true, title: "x̂" }), T.op("γ·x̂+β"), cubeOf(st.out_vals, { single: true, title: "y" })] });
     return {
-      title: final ? "Final LayerNorm" : "Add & Norm",
-      eq: `${final ? "" : `x' = ${eqTerm("res", "x + Sublayer(x)")}<br>`}
-           y = ${eqTerm("gb", "γ")} ⊙ ${eqTerm("norm", `(x' − ${eqTerm("mu", "μ")}) / √(${eqTerm("var", "σ²")} + ε)`)} + ${eqTerm("gb", "β")} ${eqTerm("all", "")}
+      title: final ? "Final LayerNorm" : res >= 0 ? "Add & Norm" : "LayerNorm",
+      eq: `${res < 0 ? "" : `x' = ${eqTerm("res", "x + Sublayer(x)")}<br>`}
+           y = ${eqTerm("gb", "γ")} ⊙ ${eqTerm("norm", `(${xn} − ${eqTerm("mu", "μ")}) / √(${eqTerm("var", "σ²")} + ε)`)} + ${eqTerm("gb", "β")} ${eqTerm("all", "")}
            <div class="eq-sub">
-             ${eqTerm("mu", `μ = <span class="frac">1/${d}</span> Σ<sub>j=1…${d}</sub> x'<sub>j</sub>`)}
+             ${eqTerm("mu", `μ = <span class="frac">1/${d}</span> Σ<sub>j=1…${d}</sub> ${xn}<sub>j</sub>`)}
              <span class="eq-gap"></span>
-             ${eqTerm("var", `σ² = <span class="frac">1/${d}</span> Σ<sub>j=1…${d}</sub> (x'<sub>j</sub> − μ)²`)}
+             ${eqTerm("var", `σ² = <span class="frac">1/${d}</span> Σ<sub>j=1…${d}</sub> (${xn}<sub>j</sub> − μ)²`)}
            </div>`,
       stages,
     };
   }
+
+  // The feed-forward activation, as configured: ReLU (original Transformer) or GELU (ViT).
+  const erf = x => {                                   // Abramowitz & Stegun 7.1.26, |error| < 1.5e-7
+    const sg = Math.sign(x), a = Math.abs(x), t = 1 / (1 + 0.3275911 * a);
+    return sg * (1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a));
+  };
+  const ACTS = {
+    relu: { name: "ReLU", op: "max(0, ·)", eq: x => `max(0, ${x})`, f: x => Math.max(0, x),
+            how: "Negative values are set to 0.", tex: x => `\\max(0,\ ${ts3(x)})` },
+    gelu: { name: "GELU", op: "x·Φ(x)", eq: x => `GELU(${x})`, f: x => 0.5 * x * (1 + erf(x / Math.SQRT2)),
+            how: "GELU(x) = x·Φ(x), where Φ is the standard normal CDF: large positive values pass almost unchanged, negative values are squashed towards 0 instead of being cut to 0.",
+            tex: x => `${ts3(x)}\\cdot\\Phi(${t3(x)}) = ${ts3(x)}\\cdot\\tfrac{1}{2}\\left(1 + \\operatorname{erf}\\!\\left(\\tfrac{${t3(x)}}{\\sqrt{2}}\\right)\\right) = ${ts3(x)}\\times${t3(0.5 * (1 + erf(x / Math.SQRT2)))}` },
+    silu: { name: "SiLU", op: "x·σ(x)", eq: x => `SiLU(${x})`, f: x => x / (1 + Math.exp(-x)),
+            how: "SiLU(x) = x·σ(x): negative values are squashed towards 0.", tex: x => `${ts3(x)}\\cdot\\sigma(${t3(x)})` },
+  };
+  const ACT = ACTS[cfg.activation] || ACTS.relu;
 
   function ffnStages(st) {
     const l1 = subIdx(st, byVar("net[0]")), re = subIdx(st, byLabel(/activation$/)), l2 = subIdx(st, byVar("net[3]"));
@@ -249,42 +205,19 @@
       return `${Math.round(100 * f.filter(x => x === 0).length / f.length)}% of the sampled values are now 0`;
     };
     return {
-      title: "Position-wise Feed-Forward",
-      eq: `FFN(x) = ${eqTerm("relu", `max(0, ${eqTerm("w1", "xW<sub>1</sub> + b<sub>1</sub>")})`)} ${eqTerm("w2", "W<sub>2</sub> + b<sub>2</sub>")} ${eqTerm("x", "")}`,
+      title: SPEC.ffn_title || "Position-wise Feed-Forward",
+      eq: `${SPEC.ffn_name || "FFN"}(x) = ${eqTerm("relu", ACT.eq(eqTerm("w1", "xW<sub>1</sub> + b<sub>1</sub>")))} ${eqTerm("w2", "W<sub>2</sub> + b<sub>2</sub>")} ${eqTerm("x", "")}`,
       stages: [
         { title: "Input", term: "x", sub: null, how: "The same small network is applied to every position independently.",
           parts: () => [cubeOf(st.in_vals, { single: true, title: "x" })] },
         { title: `Expand: ${d} → ${cfg.d_ff}`, term: "w1", sub: l1, how: "A linear layer widens every position's features.",
           parts: () => [cubeOf(st.in_vals, { single: true, title: "x", cw: 18 }), T.op("× W₁ + b₁", `${d} → ${cfg.d_ff}`), subPart(st, l1, { single: true, title: "hidden", cw: 18 })] },
-        { title: `${cfg.activation.toUpperCase()}`, term: "relu", sub: re, how: `Negative values are set to 0. ${zeros()}.`,
-          parts: () => [subPart(st, l1, { single: true, title: "before", cw: 18 }), T.op("max(0, ·)"), subPart(st, re, { single: true, title: "after", cw: 18 })] },
+        { title: ACT.name, term: "relu", sub: re, how: cfg.activation === "relu" ? `Negative values are set to 0. ${zeros()}.` : ACT.how,
+          parts: () => [subPart(st, l1, { single: true, title: "before", cw: 18 }), T.op(ACT.op), subPart(st, re, { single: true, title: "after", cw: 18 })] },
         { title: `Project back: ${cfg.d_ff} → ${d}`, term: "w2", sub: l2, how: "A second linear layer returns to the model width.",
           parts: () => [subPart(st, re, { single: true, title: "hidden", cw: 18 }), T.op("× W₂ + b₂", `${cfg.d_ff} → ${d}`), cubeOf(st.out_vals, { single: true, title: "output", cw: 18 })] },
       ],
     };
-  }
-
-  function maskStages(st) {
-    const sub = (st.subs || []).length ? 0 : null;
-    if (st.key === "causal_mask") {
-      const lab = words("tgt");
-      return { title: "Causal mask", eq: `M<sub>ij</sub> = ${eqTerm("m", "[ j > i ]")}`,
-        stages: [{ title: "Block the future", term: "m", sub, how: "Query i may only look at keys 0…i; everything above the diagonal is blocked.",
-          parts: () => [T.valueGrid(st.mask, r => lab[r], c => lab[c], "bool", { title: `sample ${sample() + 1}` })] }] };
-    }
-    const side = st.key === "src_pad_mask" ? "src" : "tgt";
-    return { title: "Padding mask", eq: `M = ${eqTerm("m", "(tokens == pad)")}`,
-      stages: [{ title: "Find the padding", term: "m", sub, how: "True marks padding; attention will give those keys zero weight.",
-        parts: () => [T.tokens(side), T.op("== pad"), T.valueGrid(st.mask, r => `sample ${r + 1}`, c => String(c), "bool")] }] };
-  }
-
-  function generatorStages(st) {
-    const tk = st.topk_logits;
-    return { title: "Linear (generator)", eq: `${eqTerm("l", "logits = x W<sup>T</sup>")}  (W tied to the output embedding)`,
-      stages: [{ title: `Project ${d} → ${cfg.tgt_vocab_size}`, term: "l", sub: null,
-        how: "One score per vocabulary word, for every position.",
-        parts: () => [cubeOf(st.in_vals, { single: true, title: "x", cw: 18 }), T.op("× Wᵀ"), cubeOf(st.out_vals, { single: true, title: "logits (16 of 32000 shown)", cw: 18 }),
-                      tk ? T.note(["top logits, last word:", ...tk.ids.slice(0, 3).map((id, i) => `${B.tgt_vocab[id] ?? "token " + id}: ${tk.logits[i].toFixed(2)}`)], { w: 190 }) : null].filter(Boolean) }] };
   }
 
   function softmaxStages(st) {
@@ -293,32 +226,12 @@
       title: s.label, term: terms[i] || "p", sub: i,
       how: s.formula ? `${s.formula}.` : "",
       parts: () => [subPart(st, i, { single: true, title: s.var || "", cw: 18 }),
-                    i === 3 && st.topk ? T.note(["most likely next words:", ...st.topk[sample()].ids.slice(0, 3).map((id, j) =>
+                    i === 3 && st.topk ? T.note([`${SPEC.top_label || "most likely next words"}:`, ...st.topk[sample()].ids.slice(0, 3).map((id, j) =>
                       `${B.tgt_vocab[id] ?? "token " + id}: ${(st.topk[sample()].probs[j] * 100).toFixed(4)}%`)], { w: 200 }) : null].filter(Boolean),
     }));
     return { title: "Softmax (outside the model)",
       eq: `p<sub>i</sub> = ${eqTerm("e", "exp(z<sub>i</sub> − " + eqTerm("m", "m") + ")")} / ${eqTerm("s", "Σ<sub>j</sub> exp(z<sub>j</sub> − m)")} ${eqTerm("p", "")}`,
       stages };
-  }
-
-  // "Everything at once": what the code computes in a single tensor operation for this step.
-  function parallelNote(st) {
-    const Bn = B.src.length, Tn = st.out_shape && st.out_shape.length > 1 ? st.out_shape[1] : 0;
-    const shp = s => (s ? fmt(s.shape) : "");
-    if (/embedding$/.test(st.key)) return `One indexing operation gathers all ${Bn} × ${Tn} = ${Bn * Tn} embedding rows at once; the word-by-word stages are only for explanation.`;
-    if (/^pe_/.test(st.key)) return `x + pe[:, :T] adds the whole (1, ${Tn}, ${d}) table to all ${Bn} samples in one broadcast addition; there is no loop over positions in the code.`;
-    if (/attn$/.test(st.key)) {
-      const q = subBy(st, s => s.var === "q_proj"), qi = subIdx(st, byVar("q_proj")), ki = subIdx(st, byVar("k_proj"));
-      const qs = st.subs[qi + 1], ks = st.subs[ki + 1], sc = subBy(st, byLabel(/^Dot products/));
-      return `Every query, key, head and sample is handled together: Q, K and V are three (${Bn}·${Tn}, ${d}) × (${d}, ${d}) matrix multiplications, `
-        + `and Q·Kᵀ is one batched matmul ${shp(qs)} × ${ks ? fmt([...ks.shape.slice(0, 2), ks.shape[3], ks.shape[2]]) : ""} → ${shp(sc)}, ${h > 1 ? `so all ${h} heads run in parallel.` : "for the single head."}`;
-    }
-    if (/norm\d$|_final$/.test(st.key)) return `μ, σ² and the normalization are computed for all ${Bn} × ${Tn} = ${Bn * Tn} fibres in one vectorized call (nn.LayerNorm); the single highlighted position is just an example.`;
-    if (/ffn$/.test(st.key)) return `Each linear layer is one matrix multiplication over every position at once: (${Bn}·${Tn}, ${d}) × (${d}, ${cfg.d_ff}), then (${Bn}·${Tn}, ${cfg.d_ff}) × (${cfg.d_ff}, ${d}).`;
-    if (/mask$/.test(st.key)) return "One element-wise comparison over the whole tensor builds the entire mask.";
-    if (st.key === "generator") return `One matrix multiplication scores every position against the whole vocabulary: (${Bn}·${Tn}, ${d}) × (${d}, ${cfg.tgt_vocab_size}).`;
-    if (st.key === "softmax") return `Softmax runs over the vocabulary axis for all ${Bn} × ${Tn} positions at once.`;
-    return "";
   }
 
   // ================================================================ detail presets (tiny / small)
@@ -333,7 +246,8 @@
   const tgtWord = id => B.tgt_vocab[id] ?? String(id);
   function axisLab(name, n) {
     if (["seq", "queries", "keys"].includes(name)) { const w = words(T.sideOfT(n)); return i => w[i] ?? String(i); }
-    if (name === "vocab") return i => tgtWord(i);
+    if (name === "vocab" || name === "classes") return i => tgtWord(i);
+    if (name === "patches") return i => `p${i + 1}`;                 // ViT patch tokens (no [CLS])
     if (name === "hidden (d_ff)") return i => `h${i}`;
     if (name === "head features") return i => `d${i}`;
     if (name === "features") return i => `f${i}`;
@@ -360,9 +274,11 @@
   const rowMaxFlag = m => (i, j, x) => (Math.abs(x) < 1e29 && x === Math.max(...m[i].filter(y => Math.abs(y) < 1e29)) ? "max" : "");
   const sign = x => (x < 0 ? `(${nf(x)})` : nf(x));
   // LaTeX helpers for the worked arithmetic (rendered with KaTeX below the equation).
-  const txt = x => `\\text{${String(x).replace(/[\\{}$&#%_^~]/g, c => "\\" + c)}}`;
+  // Text inside LaTeX: escape specials; "·" and "^" have no text-mode glyph in KaTeX, so they drop to math.
+  const txt = x => `\\text{${String(x).replace(/[\\{}$&#%_~]/g, c => "\\" + c)
+    .replace(/·/g, "}\\cdot\\text{").replace(/\^/g, "}{}^\\wedge\\text{")}}`;
   const texName = n => String(n).replace(/ᵀ/g, "^{\\top}").replace(/₁/g, "_1").replace(/₂/g, "_2")
-    .replace(/^W_([QKVO])/, "W_{$1}").replace(/^(context|score|weights|concat|logit|out|memory)$/, m => txt(m));
+    .replace(/^x_p$/, "x^{(p)}").replace(/^x_p$/, "x^{(p)}").replace(/^W_([QKVO])/, "W_{$1}").replace(/^(context|score|weights|concat|logit|out|memory)$/, m => txt(m));
   const t3 = x => (Math.abs(x) >= 1e29 ? "-\\infty" : x.toFixed(3));
   const ts3 = x => (x < 0 ? `(${t3(x)})` : t3(x));
   // Worked arithmetic uses 3 decimals so a learner redoing it by hand gets the shown result.
@@ -420,52 +336,6 @@
                       tA: names.a || "x", tB: names.b || "Wᵀ", tC: names.c || "y" }).parts();
     };
     return { title, term: names.term, sub: i, how: how + " PyTorch stores W as (out × in), so the code computes x · Wᵀ. Click any result cell to see its dot product.", parts, pick: true };
-  }
-
-  function embeddingD(st) {
-    const side = st.key === "input_embedding" ? "src" : "tgt";
-    const look = subIdx(st, byLabel(/^Embedding lookup/)), scale = subIdx(st, byLabel(/^Scale by/));
-    const L = st.subs[look], ids = T.idsOf(side)[sample()];
-    const rowIds = L && L.ops ? Object.keys(L.ops.rows).map(Number) : [];
-    const table = rowIds.length ? matOf(rowIds.map(id => L.ops.rows[id]), "rows", "features") : null;
-    if (table) table.rowLab = r => `${word(rowIds[r], side)} (${rowIds[r]})`;
-    const lookM = mat(L), outM = mat({ vals: { v: st.out_vals.v.map(x => x), names: ["batch", "seq", "features"], full: [0, st.out_vals.v[0].length, d], kind: "float" }, shape: [0, 0, d] });
-    const stages = [{ title: "Token ids", term: "tok", sub: null, how: "Each word has an id in the vocabulary.", parts: () => [T.tokens(side)] }];
-    ids.forEach((id, t) => stages.push({
-      title: `Look up “${word(id, side)}” (id ${id})`, term: "e", sub: look,
-      how: `Copy row ${id} of the embedding table E into position ${t}.`,
-      parts: () => [G(table, { title: "E (rows used)", hiRow: rowIds.indexOf(id), rowArrow: true }), T.op("→", "copy row"), G(lookM, { title: "E[token]", hiRow: t })],
-    }));
-    stages.push({
-      title: `Scale by √${d}`, term: "s", sub: scale, pick: true,
-      how: `Every value is multiplied by √${d} ≈ ${Math.sqrt(d).toFixed(3)}. Click a cell to check it.`,
-      parts: () => {
-        const { i, j } = pickOf({ i: 0, j: 0 });
-        const a = lookM.m[i][j], y = outM.m[i][j];
-        return [G(lookM, { title: "E[token]", hiCell: { i, j } }), T.op(`× ${Math.sqrt(d).toFixed(3)}`, `√${d}`), G(outM, { title: "X (click a cell)", hiCell: { i, j }, gridId: "C" }),
-                T.note([`${n3(a)} × √${d} = ${n3(a)} × ${Math.sqrt(d).toFixed(3)} = ${n3(a * Math.sqrt(d))}   (model: ${n3(y)})`],
-                  { tex: [`x_{${i},${j}} = E[\\text{token}]_{${j}}\\times\\sqrt{${d}} = ${t3(a)}\\times ${Math.sqrt(d).toFixed(3)} = ${t3(a * Math.sqrt(d))}\\quad ${txt(`(model: ${n3(y)})`)}`] })];
-      },
-    });
-    return { ...embeddingStages(st), stages };
-  }
-
-  function peD(st) {
-    const add = subIdx(st, byLabel(/positional encoding/));
-    const X = st.in_vals, Y = st.out_vals, P = peSlice(X), b = sample();
-    const Xm = matOf(X.v[b], "seq", "features"), Pm = matOf(P.v[b], "seq", "features"), Ym = matOf(Y.v[b], "seq", "features");
-    const stages = [{ title: "X + PE = Y", term: "all", sub: add, how: "PE depends only on the position, so the same table is added to every sample.",
-      parts: () => [G(Xm, { title: "X" }), T.op("+"), G(Pm, { title: "PE" }), T.op("="), G(Ym, { title: "Y" })] }];
-    Xm.m.forEach((_, t) => stages.push({ title: `Position ${t}: “${Xm.rowLab(t)}”`, term: "pe", sub: add,
-      how: "Row t of PE is added to row t of X, element by element. Even dims use sin, odd dims cos.",
-      parts: () => [G(Xm, { title: "X", hiRow: t, rowArrow: true }), T.op("+"), G(Pm, { title: "PE", hiRow: t, rowArrow: true }), T.op("="), G(Ym, { title: "Y", hiRow: t }),
-                    T.note(Xm.m[t].slice(0, 9).map((x, j) => { const i2 = j - (j % 2);
-                      return `f${j}: ${n3(x)} + ${j % 2 ? "cos" : "sin"}(${t} / 10000^(${i2}/${d})) = ${n3(x)} + ${s3(Pm.m[t][j])} = ${n3(Ym.m[t][j])}`; }),
-                      { tex: Xm.m[t].slice(0, 9).map((x, j) => { const i2 = j - (j % 2);
-                        return `y_{${t},${j}} = x_{${t},${j}} + \\${j % 2 ? "cos" : "sin"}\\!\\left(\\frac{${t}}{10000^{${i2}/${d}}}\\right) = ${t3(x)} + ${ts3(Pm.m[t][j])} = ${t3(Ym.m[t][j])}`; }) })] }));
-    stages.push({ title: "Y feeds Q, K and V", term: "y", sub: add, how: "The next block projects this same tensor into queries, keys and values.",
-      parts: () => [G(Ym, { title: "Y" }), T.op("→"), T.note(["Q = Y·W_Q", "K = Y·W_K", "V = Y·W_V"], { w: 140 })] });
-    return { ...peStages(st), stages };
   }
 
   // p[i][j] = exp(s_ij − m_i) / Σ_k exp(s_ik − m_i), written out with the real numbers (−∞ terms → 0).
@@ -539,8 +409,7 @@
   }
 
   function normD(st) {
-    const final = st.key.endsWith("final");
-    const res = subIdx(st, byLabel(/^Residual add/)), mu = subIdx(st, byLabel(/^Mean/)), va = subIdx(st, byLabel(/^Variance/));
+    const res = subIdx(st, byLabel(/^Residual add/)), xn = res >= 0 ? "x'" : "x", mu = subIdx(st, byLabel(/^Mean/)), va = subIdx(st, byLabel(/^Variance/));
     const nzI = subIdx(st, byLabel(/^Normalize/)), sc = subIdx(st, byLabel(/^Scale and shift/));
     const S = st.subs;
     const Xs = res >= 0 ? mat(S[res]) : matOf(st.in_vals.v[sample()], "seq", "features");
@@ -549,23 +418,23 @@
     const g = S[sc] && S[sc].ops, eps = g ? g.eps : 1e-5;
     const base = normStages(st);
     const stages = [base.stages[0]];
-    if (!final) stages.push({ title: "Residual add", term: "res", sub: res, how: "x' = x + Sublayer(x): the skip connection.", parts: () => [G(Xs, { title: "x'" })] });
+    if (res >= 0) stages.push({ title: "Residual add", term: "res", sub: res, how: "x' = x + Sublayer(x): the skip connection.", parts: () => [G(Xs, { title: "x'" })] });
     stages.push({ title: "Mean μ of a row", term: "mu", sub: mu, pick: true,
       how: "Average the features of one position (click a row to pick another).",
       parts: () => { const r = rowPick(), row = Xs.m[r];
-        return [G(Xs, { title: "x' (click a row)", hiRow: r, rowArrow: true, gridId: "C" }), T.op("mean →"),
+        return [G(Xs, { title: `${xn} (click a row)`, hiRow: r, rowArrow: true, gridId: "C" }), T.op("mean →"),
                 T.note([`μ = (${row.map(s3).join(" + ")}) / ${row.length}`, `= ${n3(row.reduce((a, b) => a + b, 0) / row.length)}   (model: ${n3(muV(r))})`],
                   { tex: [`\\mu = \\frac{${row.map(ts3).join(" + ")}}{${row.length}} = ${t3(row.reduce((a, b) => a + b, 0) / row.length)}\\quad ${txt(`(model: ${n3(muV(r))})`)}`] })]; } });
     stages.push({ title: "Variance σ²", term: "var", sub: va, pick: true,
       how: "Average squared distance from μ along the same row.",
       parts: () => { const r = rowPick(), row = Xs.m[r], m = muV(r);
-        return [G(Xs, { title: "x' (click a row)", hiRow: r, rowArrow: true, gridId: "C" }), T.op("var →"),
+        return [G(Xs, { title: `${xn} (click a row)`, hiRow: r, rowArrow: true, gridId: "C" }), T.op("var →"),
                 T.note([`μ = ${n3(m)}`, `σ² = (${row.slice(0, 6).map(x => `(${n3(x)} − ${s3(m)})²`).join(" + ")}${row.length > 6 ? " + …" : ""}) / ${row.length}`, `= ${n3(row.reduce((a, b) => a + (b - m) ** 2, 0) / row.length)}   (model: ${n3(vaV(r))})`],
                   { tex: [`\\mu = ${t3(m)}`, `\\sigma^2 = \\frac{${row.slice(0, 6).map(x => `(${t3(x)} - ${ts3(m)})^2`).join(" + ")}${row.length > 6 ? " + \\cdots" : ""}}{${row.length}} = ${t3(row.reduce((a, b) => a + (b - m) ** 2, 0) / row.length)}\\quad ${txt(`(model: ${n3(vaV(r))})`)}`] })]; } });
     stages.push({ title: "Normalize", term: "norm", sub: nzI, pick: true,
-      how: "x̂ = (x' − μ) / √(σ² + ε): this row now has mean 0 and variance 1.",
+      how: `x̂ = (${xn} − μ) / √(σ² + ε): this row now has mean 0 and variance 1.`,
       parts: () => { const r = rowPick(), m = muV(r), sd = Math.sqrt(vaV(r) + eps), xh = mat(S[nzI]);
-        return [G(Xs, { title: "x' (click a row)", hiRow: r, gridId: "C" }), T.op("(x−μ)/σ"), G(xh, { title: "x̂", hiRow: r }),
+        return [G(Xs, { title: `${xn} (click a row)`, hiRow: r, gridId: "C" }), T.op("(x−μ)/σ"), G(xh, { title: "x̂", hiRow: r }),
                 T.note([`μ = ${n3(m)},  σ = √(σ² + ε) = ${n3(sd)}`, ...Xs.m[r].slice(0, 6).map((x, j) => `x̂${j} = (${n3(x)} − ${s3(m)}) / ${n3(sd)} = ${n3((x - m) / sd)}`)],
                   { tex: [`\\mu = ${t3(m)},\\qquad \\sigma = \\sqrt{\\sigma^2 + \\varepsilon} = ${t3(sd)}`,
                           ...Xs.m[r].slice(0, 6).map((x, j) => `\\hat{x}_{${j}} = \\frac{${t3(x)} - ${ts3(m)}}{${t3(sd)}} = ${t3((x - m) / sd)}`)] })]; } });
@@ -583,12 +452,34 @@
     return { ...base, stages };
   }
 
+  // Recomputed from values shown to 3 significant figures, so allow the same tolerance as the matmul view.
+  const close = (v, m) => Math.abs(v - m) < 0.02 + 0.01 * Math.abs(m);
+  const checkTxt = (v, m) => (close(v, m) ? `✓ matches the model (${n3(m)})` : `(model: ${n3(m)})`);
+  const checkTex = (v, m) => (close(v, m) ? `\\checkmark\\ ${txt(`matches the model (${n3(m)}; inputs shown rounded)`)}` : txt(`(model: ${n3(m)})`));
+
+  // GELU / SiLU: every cell changes, so show one picked cell's arithmetic instead of counting zeros.
+  function smoothActD(st, re) {
+    const S = st.subs;
+    return { title: `${ACT.name}: ${ACT.op}`, term: "relu", sub: re, pick: true,
+      how: `${ACT.how} Click a cell to see its value worked out.`,
+      parts: () => {
+        const before = S[re] && S[re].ops ? matOf(S[re].ops.x[sample()], "seq", "hidden (d_ff)") : null, after = mat(S[re]);
+        if (!before || !after) return [subPart(st, re, { single: true, title: "after" })];
+        const { i, j } = pickOf(argmaxAbs(before.m));
+        const x = before.m[i][j], y = ACT.f(x);
+        return [G(before, { title: "before", hiCell: { i, j }, flags: (r, c, v) => (v < 0 ? "neg" : "") }), T.op(ACT.op),
+                G(after, { title: "after (click a cell)", hiCell: { i, j }, gridId: "C" }),
+                T.note([`${ACT.name}(${n3(x)}) = ${n3(y)}   ${checkTxt(y, after.m[i][j])}`],
+                  { tex: [`\\operatorname{${ACT.name}}(${t3(x)}) = ${ACT.tex(x)} = ${t3(y)}\\quad ${checkTex(y, after.m[i][j])}`] })];
+      } };
+  }
+
   function ffnD(st) {
     const l1 = subIdx(st, byVar("net[0]")), re = subIdx(st, byLabel(/activation$/)), l2 = subIdx(st, byVar("net[3]"));
     const S = st.subs;
     return { ...ffnStages(st), stages: [
       linearStage(st, l1, `Expand: h = x · W₁ᵀ + b₁ (${d} → ${cfg.d_ff})`, { term: "w1", a: "x", b: "W₁ᵀ", c: "h", out: "hidden (d_ff)" }, "Widen each position's features."),
-      { title: `${{ relu: "ReLU", gelu: "GELU", silu: "SiLU" }[cfg.activation] || cfg.activation}: negatives become 0`, term: "relu", sub: re,
+      cfg.activation !== "relu" ? smoothActD(st, re) : { title: "ReLU: negatives become 0", term: "relu", sub: re,
         how: "Cells that were negative (red) are set to 0 (mint); the largest value is marked ★.",
         parts: () => { const before = S[re] && S[re].ops ? matOf(S[re].ops.x[sample()], "seq", "hidden (d_ff)") : null, after = mat(S[re]);
           const zeroed = before ? before.m.flat().filter(x => x < 0).length : 0;
@@ -600,16 +491,6 @@
     ] };
   }
 
-  function generatorD(st) {
-    const base = generatorStages(st);
-    if (!st.ops) return base;
-    const b = sample();
-    return { ...base, stages: [{ title: `logits = x · Wᵀ (${d} → ${cfg.tgt_vocab_size} words)`, term: "l", sub: null, pick: true,
-      how: "One score per vocabulary word. W is tied to the output embedding. Click a cell.",
-      parts: () => matmul({ A: matOf(st.ops.x[b], "seq", "features"), Bm: matOf(transpose(st.ops.W), "features", "vocab"),
-                            Cm: matOf(st.out_vals.v[b], "seq", "vocab"), tA: "x", tB: "Wᵀ", tC: "logit" }).parts() }] };
-  }
-
   function softmaxD(st) {
     const S = st.subs, b = sample();
     const Z = matOf(st.in_vals.v[b], "seq", "vocab");
@@ -619,9 +500,9 @@
         parts: () => [G(Z, { title: "logits z", flags: rowMaxFlag(Z.m) }), T.op("max →"), G(m, { title: "m" })] },
       { title: "Exponentiate e = exp(z − m)", term: "e", sub: 1, how: "The row max becomes exp(0) = 1; everything else is smaller.",
         parts: () => [G(Z, { title: "z" }), T.op("exp(z−m)"), G(e, { title: "e", flags: rowMaxFlag(e.m) })] },
-      { title: "Sum Σ over the vocabulary", term: "s", sub: 2, how: "Add up each row.",
+      { title: `Sum Σ over the ${SPEC.out_axis || "vocabulary"}`, term: "s", sub: 2, how: "Add up each row.",
         parts: () => [G(e, { title: "e", rowArrow: true, hiRow: 0 }), T.op("Σ →"), G(sum, { title: "Σ" })] },
-      { title: "Divide p = e / Σ", term: "p", sub: 3, pick: true, how: "Each row now sums to 1; the most likely next word is marked ★. Click a probability to see its calculation.",
+      { title: "Divide p = e / Σ", term: "p", sub: 3, pick: true, how: `Each row now sums to 1; the most likely ${SPEC.out_item || "next word"} is marked ★. Click a probability to see its calculation.`,
         parts: () => { const { i, j } = pickOf({ i: 0, j: p.m[0].indexOf(Math.max(...p.m[0])) });
           const cellN = softmaxCell(Z.m[i], i, j, p.rowLab(i), p.colLab(j), "p", "z", p.m[i][j]);
           return [G(p, { title: "p (click a cell)", hiCell: { i, j }, gridId: "C", flags: rowMaxFlag(p.m) }),
@@ -629,51 +510,63 @@
     ] };
   }
 
-  function buildDetail(st) {
-    if (/embedding$/.test(st.key)) return embeddingD(st);
-    if (/^pe_/.test(st.key)) return peD(st);
-    if (/attn$/.test(st.key)) return attentionD(st);
-    if (/norm\d$|_final$/.test(st.key)) return normD(st);
-    if (/ffn$/.test(st.key)) return ffnD(st);
-    if (st.key === "generator") return generatorD(st);
-    if (st.key === "softmax") return softmaxD(st);
+  // ---------------------------------------------------------------- model hook-up
+  const API = {
+    App, T, cfg, B, STEPS, SPEC, d, h, dk, esc, fmt, word, sample,
+    subIdx, subBy, byLabel, byVar, hasVals, one, words, nf, cubeOf, subPart, headGrid, shapeOnly, eqTerm,
+    mat, matOf, transpose, G, argmaxAbs, rowMaxFlag, sign, txt, texName, t3, ts3, n3, s3,
+    matmul, linearStage, softmaxCell, pickOf: def => pickOf(def),
+    attentionStages, attentionD, normStages, normD, ffnStages, ffnD, softmaxStages, softmaxD,
+    checkTxt, checkTex,
+    get DETAIL() { return DETAIL; },
+  };
+  const M = window.StageModel(API);
+
+  // Shared steps are recognised by their key; the model handles everything else first.
+  function genericBuild(st) {
+    if (/attn$/.test(st.key)) return DETAIL ? attentionD(st) : attentionStages(st);
+    if (/norm\d$|_final$/.test(st.key)) return DETAIL ? normD(st) : normStages(st);
+    if (/ffn$/.test(st.key)) return DETAIL ? ffnD(st) : ffnStages(st);
+    if (st.key === "softmax") return DETAIL ? softmaxD(st) : softmaxStages(st);
     return null;
   }
-
   function buildFor(st) {
-    if (DETAIL) { const m = buildDetail(st); if (m) return m; }
-    if (/embedding$/.test(st.key)) return embeddingStages(st);
-    if (/^pe_/.test(st.key)) return peStages(st);
-    if (/attn$/.test(st.key)) return attentionStages(st);
-    if (/norm\d$|_final$/.test(st.key)) return normStages(st);
-    if (/ffn$/.test(st.key)) return ffnStages(st);
-    if (/mask$/.test(st.key)) return maskStages(st);
-    if (st.key === "generator") return generatorStages(st);
-    if (st.key === "softmax") return softmaxStages(st);
-    return { title: st.title, eq: "", stages: [{ title: st.title, term: "", sub: null, how: st.desc, parts: () => [] }] };
+    return (M.build && M.build(st)) || genericBuild(st)
+      || { title: st.title, eq: "", stages: [{ title: st.title, term: "", sub: null, how: st.desc, parts: () => [] }] };
+  }
+
+  // "Everything at once": what the code computes in a single tensor operation for this step.
+  function parallelNote(st) {
+    const own = M.parallel && M.parallel(st);
+    if (own != null) return own;
+    const Bn = B.src.length, Tn = st.out_shape && st.out_shape.length > 1 ? st.out_shape[1] : 0;
+    const shp = s => (s ? fmt(s.shape) : "");
+    if (/attn$/.test(st.key)) {
+      const qi = subIdx(st, byVar("q_proj")), ki = subIdx(st, byVar("k_proj"));
+      const qs = st.subs[qi + 1], ks = st.subs[ki + 1], sc = subBy(st, byLabel(/^Dot products/));
+      return `Every query, key, head and sample is handled together: Q, K and V are three (${Bn}·${Tn}, ${d}) × (${d}, ${d}) matrix multiplications, `
+        + `and Q·Kᵀ is one batched matmul ${shp(qs)} × ${ks ? fmt([...ks.shape.slice(0, 2), ks.shape[3], ks.shape[2]]) : ""} → ${shp(sc)}, ${h > 1 ? `so all ${h} heads run in parallel.` : "for the single head."}`;
+    }
+    if (/norm\d$|_final$/.test(st.key)) return `μ, σ² and the normalization are computed for all ${Bn} × ${Tn} = ${Bn * Tn} fibres in one vectorized call (nn.LayerNorm); the single highlighted position is just an example.`;
+    if (/ffn$/.test(st.key)) return `Each linear layer is one matrix multiplication over every position at once: (${Bn}·${Tn}, ${d}) × (${d}, ${cfg.d_ff}), then (${Bn}·${Tn}, ${cfg.d_ff}) × (${cfg.d_ff}, ${d}).`;
+    if (st.key === "softmax") return `Softmax runs over the ${SPEC.out_axis || "vocabulary"} axis for all ${Bn} × ${Tn} positions at once.`;
+    return "";
   }
 
   // ---------------------------------------------------------------- breadcrumb
-  const ENC = ["enc_self_attn", "enc_norm1", "enc_ffn", "enc_norm2"];
-  const DEC = ["dec_masked_attn", "dec_norm1", "dec_cross_attn", "dec_norm2", "dec_ffn", "dec_norm3"];
-  const SHORT = { input_embedding: "Embedding", pe_enc: "PE", enc_self_attn: "MHA", enc_norm1: "A&N", enc_ffn: "FFN", enc_norm2: "A&N",
-    enc_final: "Final LN", output_embedding: "Embedding", pe_dec: "PE", causal_mask: "Causal mask", src_pad_mask: "Pad mask",
-    tgt_pad_mask: "Pad mask", dec_masked_attn: "Masked MHA", dec_norm1: "A&N", dec_cross_attn: "Cross", dec_norm2: "A&N",
-    dec_ffn: "FFN", dec_norm3: "A&N", dec_final: "Final LN", generator: "Linear", softmax: "Softmax" };
+  // M.crumbs = { short: {key: label}, rows: [{ label, items: [key | {group, which, keys, N}], tail }] }
   const stepIndex = (key, layer) => STEPS.findIndex(s => s.key === key && (s.layer == null || layer == null || s.layer === layer));
+  const GROUPS = M.crumbs.rows.flatMap(r => r.items.filter(it => typeof it === "object"));
+  const lastLayer = Object.fromEntries(GROUPS.map(g => [g.which, 1]));
 
   function crumbs(st) {
-    const L = { enc: st.key.startsWith("enc_") && st.layer ? st.layer : lastLayer.enc,
-                dec: st.key.startsWith("dec_") && st.layer ? st.layer : lastLayer.dec };
-    const chip = (key, layer = null) => `<button type="button" class="crumb${st.key === key ? " on" : ""}" data-key="${key}" data-layer="${layer ?? ""}">${SHORT[key]}</button>`;
-    const grp = (name, keys, which, N) => `<span class="cgroup${keys.includes(st.key) ? " on" : ""}">
-        <span class="cname">${name}</span><button type="button" class="clayer" data-which="${which}" data-d="-1">‹</button><b>${L[which]}/${N}</b><button type="button" class="clayer" data-which="${which}" data-d="1">›</button>
-        ${keys.map(k => chip(k, L[which])).join("")}</span>`;
-    const sep = `<span class="csep">›</span>`;
-    return `<span class="crow"><span class="clabel">encoder</span>${["src_pad_mask", "input_embedding", "pe_enc"].map(k => chip(k)).join(sep)}${sep}
-        ${grp("Enc", ENC, "enc", cfg.n_encoder_layers)}${sep}${chip("enc_final")}<span class="csep">→ memory</span></span>
-      <span class="crow"><span class="clabel">decoder</span>${["tgt_pad_mask", "causal_mask", "output_embedding", "pe_dec"].map(k => chip(k)).join(sep)}${sep}
-        ${grp("Dec", DEC, "dec", cfg.n_decoder_layers)}${sep}${["dec_final", "generator", "softmax"].map(k => chip(k)).join(sep)}</span>`;
+    const C = M.crumbs, sep = `<span class="csep">›</span>`;
+    const L = which => (st.key.startsWith(which + "_") && st.layer ? st.layer : lastLayer[which]);
+    const chip = (key, layer = null) => `<button type="button" class="crumb${st.key === key ? " on" : ""}" data-key="${key}" data-layer="${layer ?? ""}">${C.short[key]}</button>`;
+    const item = it => (typeof it === "string" ? chip(it) : `<span class="cgroup${it.keys.includes(st.key) ? " on" : ""}">
+        <span class="cname">${it.group}</span><button type="button" class="clayer" data-which="${it.which}" data-d="-1">‹</button><b>${L(it.which)}/${it.N}</b><button type="button" class="clayer" data-which="${it.which}" data-d="1">›</button>
+        ${it.keys.map(k => chip(k, L(it.which))).join("")}</span>`);
+    return C.rows.map(r => `<span class="crow"><span class="clabel">${r.label}</span>${r.items.map(item).join(sep)}${r.tail ? `<span class="csep">${r.tail}</span>` : ""}</span>`).join("\n");
   }
 
   // ---------------------------------------------------------------- render
@@ -695,7 +588,6 @@
     <p class="st-foot" id="stFoot"></p>`;
   const $ = id => document.getElementById(id);
   let model = null, stage = 0, forStep = -1;
-  const lastLayer = { enc: 1, dec: 1 };
 
   function draw() {
     const { cur } = App.state();
@@ -776,8 +668,7 @@
   function rebuild(keepStage = false) {
     const { cur } = App.state();
     const st = STEPS[cur];
-    if (st.key.startsWith("enc_") && st.layer) lastLayer.enc = st.layer;
-    if (st.key.startsWith("dec_") && st.layer) lastLayer.dec = st.layer;
+    GROUPS.forEach(g => { if (st.key.startsWith(g.which + "_") && st.layer) lastLayer[g.which] = st.layer; });
     if (forStep !== cur) { Object.keys(picks).forEach(k => delete picks[k]); headSel = 0; }
     model = buildFor(st);
     if (!keepStage || forStep !== cur) stage = 0;
@@ -807,10 +698,10 @@
     if (smp) return App.setSample(+smp.dataset.sample);
     const cl = e.target.closest(".clayer");
     if (cl) {
-      const which = cl.dataset.which, N = which === "enc" ? cfg.n_encoder_layers : cfg.n_decoder_layers;
+      const which = cl.dataset.which, g = GROUPS.find(x => x.which === which), N = g.N;
       const nl = ((lastLayer[which] - 1 + +cl.dataset.d + N) % N) + 1;
       const st = STEPS[App.state().cur];
-      const key = st.key.startsWith(which + "_") && st.layer ? st.key : (which === "enc" ? ENC[0] : DEC[0]);
+      const key = st.key.startsWith(which + "_") && st.layer ? st.key : g.keys[0];
       lastLayer[which] = nl;
       return App.goto(stepIndex(key, nl));
     }

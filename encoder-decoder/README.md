@@ -166,10 +166,10 @@ flowchart LR
     model["model code<br/>(transformer.py …)"] --> sim
     sim["ui/simulate.py<br/>traced forward pass per preset"] --> build
     notes["ui/paper.py<br/>ui/impl_notes.py"] --> build
-    build["ui/build_ui.py"] --> page["ui/architecture.html<br/>(template + DATA)"]
-    page --> dock["js/dock.js<br/>layout"]
-    page --> tensors["js/tensors.js<br/>isometric drawing"]
-    page --> stage["js/stage.js<br/>operation walkthrough"]
+    tracer["../shared/py/tracer.py<br/>hooks · settrace · slicing"] --> sim
+    build["ui/build_ui.py<br/>(../shared/py/build.py)"] --> page["ui/architecture.html<br/>(shared template + DATA)"]
+    shell["../shared/ui<br/>template · dock · tensors · stage-core"] --> page
+    own["ui/js<br/>model.js · stage-model.js"] --> page
 ```
 
 `ui/simulate.py` runs one forward pass per preset. It points the project modules' `get_settings()` at the
@@ -178,9 +178,13 @@ Forward hooks on the modules that make up the diagram mark where each step start
 records which project lines ran inside it and which tensors those lines produced.
 
 `ui/build_ui.py` gathers the traces, the paper notes and the implementation notes into one JSON blob and
-writes it into `ui/template.html`. The page is then three small scripts on top: `dock.js` (the layout,
-no dependencies), `tensors.js` (cubes, grids and arrows sized to their text) and `stage.js` (turning each
-step into stages).
+writes it into the shared page template, with every script inlined so the page is one self-contained file.
+The model-independent parts live in [`../shared`](../shared) and are used by every model in the repo:
+the tracer, the template, `dock.js` (the layout, no dependencies), `tensors.js` (cubes, grids and arrows sized
+to their text) and `stage-core.js` (turning each step into stages, with the attention, LayerNorm,
+feed-forward, softmax and matmul views). This folder adds only what is specific to the encoder–decoder:
+`ui/js/model.js` (the diagram) and `ui/js/stage-model.js` (embeddings, positional encoding, masks, the
+generator and the breadcrumb).
 
 ### What a step is made of
 
@@ -223,7 +227,7 @@ uv run ui/build_ui.py
 uv run demo/capture.py   # needs google-chrome and ffmpeg
 ```
 
-`capture.py` serves the page, drives headless Chrome through the views listed in `SHOTS_SPEC` (using the URL
+`capture.py` lists the shots; `../shared/py/capture.py` serves the page, drives headless Chrome through the views listed in `SHOTS_SPEC` (using the URL
 parameters above), and writes the screenshots, the carousel PDF, `walkthrough.mp4` and `walkthrough.gif`.
 
 ## Project structure
@@ -240,14 +244,14 @@ encoder-decoder/
 ├── inputEmbedding.py / outputEmbedding.py
 ├── main.py                     # smoke test: one forward pass from config.yml
 ├── ui/
-│   ├── simulate.py             # the traced forward pass: steps, sub-steps, lines, tensors, operands
+│   ├── simulate.py             # the traced forward pass: hooks, masks, softmax, step titles
 │   ├── presets.py              # tiny / small / full
-│   ├── paper.py / paper_pdf.py # paper notes, and locating them in your own PDF
+│   ├── paper.py                # paper notes and where they are in your own PDF
 │   ├── impl_notes.py           # details not in the paper, pinned to code
-│   ├── build_ui.py / serve.py  # build the page / build and serve it
-│   ├── template.html           # the page; architecture.html is generated from it
-│   └── js/                     # dock.js · tensors.js · stage.js
-└── demo/                       # walkthrough, carousel, screenshots, and capture.py
+│   ├── build_ui.py / serve.py  # build the page / build and serve it (thin wrappers over ../shared/py)
+│   ├── architecture.html       # generated: the whole page in one file
+│   └── js/                     # model.js (diagram) · stage-model.js (model-specific stages)
+└── demo/                       # walkthrough, carousel, screenshots, and capture.py (shot list)
 ```
 
 ## License

@@ -1,53 +1,26 @@
 """
-Run one real forward pass of the Transformer on a small simulated batch and record a
-step-by-step execution trace for the UI.
-
-For each step we record:
-  * which diagram block is running (and which encoder/decoder layer),
-  * the exact project source lines that executed (captured with sys.settrace),
-  * the call stack of project frames that led there,
-  * input/output tensor shapes, a value preview, and (for attention) the weights.
+Run one real forward pass of the encoder–decoder Transformer on a small simulated batch and
+record a step-by-step execution trace for the UI (the generic tracing lives in shared/py/tracer.py).
 """
 
-import contextlib
-import importlib
-import inspect
 import math
-import re
 import sys
 from pathlib import Path
 
 import torch
 
 ROOT = Path(__file__).resolve().parent.parent
-PROJECT_FILES = {str(p.resolve()): p.name for p in ROOT.glob("*.py")}
+sys.path.insert(0, str(ROOT.parent / "shared" / "py"))
+import tracer as tr  # noqa: E402
+from tracer import Tracer, DimNamer, cube_slice, fmt as _fmt, rl as _rl, shape as _shape  # noqa: E402
 
 # Default simulated translation batch (en → de). Sample 2 is shorter, so it gets padded.
 SRC_SENTENCES = ["the cat sat on the mat", "I love you"]
 TGT_SENTENCES = ["die Katze saß auf der Matte", "ich liebe dich"]
 
-# Detail mode (tiny / small presets): keep every value, for every layer, plus matmul operands.
-DETAIL = {"on": False}
-
 # Project modules that read the configuration through `get_settings()`.
 SETTINGS_MODULES = ["transformer", "encoder", "decoder", "multiheadAttention", "feedForward",
                     "inputEmbedding", "outputEmbedding", "positionalEncoding", "selfAttention"]
-
-
-@contextlib.contextmanager
-def use_settings(settings):
-    """Temporarily make every project module see `settings` (no model code changes needed)."""
-    saved = {}
-    for name in SETTINGS_MODULES:
-        mod = importlib.import_module(name)
-        saved[name] = mod.get_settings
-        mod.get_settings = lambda *a, **k: settings
-    try:
-        yield
-    finally:
-        for name, fn in saved.items():
-            importlib.import_module(name).get_settings = fn
-
 
 # ----------------------------------------------------------------------------------
 # Step metadata: trace key -> (diagram block key, component id, tensor role)
@@ -77,112 +50,8 @@ STEP_MAP = {
 }
 
 
-def _shape(x) -> list | None:
-    return list(x.shape) if isinstance(x, torch.Tensor) else None
-
-
-CUBE_DIMS = 16  # feature dims sampled per position for the tensor cube
-
-
-def _r(v: float) -> float:
-    """Round to 3 significant figures (keeps tiny probabilities like 3.1e-5). ±inf → ±1e30."""
-    if v != v:
-        return 0.0
-    if v in (float("inf"), float("-inf")):
-        return 1e30 if v > 0 else -1e30
-    return float(f"{v:.3g}") if v else 0.0
-
-
-def _rl(obj):
-    return [_rl(o) for o in obj] if isinstance(obj, list) else _r(float(obj))
-
-
-def _cube_slice(x) -> dict | None:
-    """A small, evenly spaced slice of a (B, T, D) float tensor for the tensor cube.
-
-    About every (D // CUBE_DIMS)-th feature is kept, so with D = 512 and 8 heads each head
-    contributes exactly 2 of the 16 sampled dims.
-    """
-    if not isinstance(x, torch.Tensor) or x.dim() != 3 or not x.is_floating_point():
-        return None
-    d = x.shape[-1]
-    if DETAIL["on"]:
-        return {"dims": list(range(d)), "D": d, "v": _rl(x.float().tolist())}
-    k = min(CUBE_DIMS, d)
-    # Alternate even/odd dims (0, 33, 64, 97, …) so positional-encoding sines (even) and
-    # cosines (odd) both appear, while each head still contributes exactly 2 dims.
-    idx = [min(d - 1, i * d // k + (i % 2)) for i in range(k)]
-    return {"dims": idx, "D": d, "v": _rl(x[:, :, idx].float().tolist())}
-
-
-class DimNamer:
-    """Names tensor axes from their position and size (batch, heads, seq, features…)."""
-
-    def __init__(self, B, src_len, tgt_len, d_model, d_ff, heads, vocab):
-        self.B, self.lens = B, {src_len, tgt_len}
-        self.sizes = {d_model: "features", d_ff: "hidden (d_ff)", d_model // heads: "head features",
-                      vocab: "vocab"}
-
-    def last(self, n: int, keys: bool) -> str:
-        if keys and n in self.lens:
-            return "keys"
-        return self.sizes.get(n) or ("seq" if n in self.lens else "dim")
-
-    KEYS_LAST = re.compile(r"^(Dot products|Add the mask|Softmax over|Zero any|Reshape padding|Merge causal|Boolean mask)")
-    HEAD_LAST = re.compile(r"^(Split into heads|Weighted sum)")
-    HIDDEN = re.compile(r"^(Linear net\[0\]|ReLU|GELU|SiLU)")
-    VOCAB = re.compile(r"^(Max logit|Exponentiate|Sum over the vocabulary|Divide)")
-
-    def __call__(self, shape: list[int], label: str = "", causal: bool = False) -> list[str]:
-        n = len(shape)
-        if n == 4:
-            last = ("keys" if self.KEYS_LAST.match(label) else "head features" if self.HEAD_LAST.match(label)
-                    else self.last(shape[3], keys=True))
-            return ["batch", "heads", "queries", last]
-        if n == 3:
-            last = ("hidden (d_ff)" if self.HIDDEN.match(label) else "vocab" if self.VOCAB.match(label)
-                    else "features" if label else self.last(shape[2], keys=False))
-            return ["batch", "seq", last]
-        if n == 2 and label:
-            if label.startswith("Upper triangle") or causal:
-                return ["queries", "keys"]
-            if label.startswith(("Compare every token", "Boolean mask")):
-                return ["batch", "keys" if label.startswith("Boolean") else "seq"]
-        if n == 2:
-            if shape[0] == self.B and shape[1] in self.lens:
-                return ["batch", "seq"]
-            if shape[0] == shape[1]:
-                return ["queries", "keys"]
-            return ["rows", "cols"]
-        return ["dim"] * n
-
-
-SUB_LAST = {3: 16, 4: 8}  # how many entries of the last axis to keep for 3-D / 4-D tensors
-
-
-def _sub_slice(t: torch.Tensor, names: list[str]) -> dict:
-    """A small, display-ready slice of any tensor (singleton axes squeezed, last axis sampled)."""
-    shape = list(t.shape)
-    keep = [i for i, n in enumerate(shape) if n != 1] or [len(shape) - 1]
-    tt = t.detach().reshape([shape[i] for i in keep])
-    nm, full = [names[i] for i in keep], [shape[i] for i in keep]
-    idx = None
-    cap = None if DETAIL["on"] else SUB_LAST.get(tt.dim())
-    if cap and full[-1] > cap:
-        idx = [i * full[-1] // cap for i in range(cap)]
-        tt = tt.index_select(-1, torch.tensor(idx))
-    kind = "bool" if t.dtype == torch.bool else "float" if t.is_floating_point() else "int"
-    return {"v": _rl(tt.float().tolist()), "names": nm, "full": full, "idx": idx, "kind": kind}
-
-
-def _short(code: str) -> str:
-    code = code.strip()
-    return code if len(code) <= 70 else code[:67] + "…"
-
-
-def _label(code: str, var: str | None) -> str:
-    """Human-readable name for the operation a line performs."""
-    rules = [
+# Names for the operations a line performs (first matching pattern wins).
+LABEL_RULES = [
         ("torch.matmul(q, k.transpose", "Dot products Q·Kᵀ, scaled by 1/√d_k"),
         ("torch.matmul(attn_weights", "Weighted sum of values: weights · V"),
         ("torch.softmax", "Softmax over the keys"),
@@ -198,205 +67,13 @@ def _label(code: str, var: str | None) -> str:
         ("self.pe[:, :seq_len]", "Add the positional encoding"),
         ("* self.scale", "Scale by √d_model"),
     ]
-    for pat, lab in rules:
-        if pat in code:
-            return lab
-    return f"{var} = …" if var else _short(code)
-
-
-def _fmt(shape) -> str:
-    return "(" + ", ".join(map(str, shape)) + ")"
-
-
-class Tracer:
-    """Collects executed project lines and groups them into steps."""
-
-    def __init__(self, namer=None):
-        self.steps: list[dict] = []
-        self.stack: list[dict] = []
-        self.namer = namer
-        self.pending: dict = {}   # frame -> (line being executed, {local name: id(tensor)})
-        self.lines: dict[str, list[str]] = {}
-
-    # ---- sub-steps ----------------------------------------------------------------
-    def code_at(self, file: str, line: int) -> str:
-        if file not in self.lines:
-            self.lines[file] = (ROOT / file).read_text(encoding="utf-8").splitlines()
-        return self.lines[file][line - 1]
-
-    def record_sub(self, t, file: str | None, line: int | None, label: str, var: str | None = None,
-                   formula: str | None = None, force: bool = False, ops: dict | None = None) -> None:
-        """Add one tensor operation to the running step (deduplicated by tensor identity)."""
-        if not self.stack or not isinstance(t, torch.Tensor):
-            return
-        step = self.stack[-1]
-        # Keep strong references so a freed temporary's id can't be reused and mistaken for a seen tensor.
-        seen = step.setdefault("_seen", {})
-        if seen.get(id(t)) is t and not force:
-            return
-        seen[id(t)] = t
-        sub = {"label": label, "var": var, "file": file, "line": line, "shape": list(t.shape),
-               "dtype": str(t.dtype).replace("torch.", ""), "formula": formula}
-        if file and line:
-            sub["code"] = _short(self.code_at(file, line))
-        subs = step.setdefault("subs", [])
-        if (DETAIL["on"] or step["layer"] in (None, 1)) and self.namer:   # full detail, or layer 1 only
-            # In masked self-attention the first boolean mask converted is the causal (T, T) one.
-            causal = (label.startswith("Boolean mask") and step["key"] == "dec_masked_attn"
-                      and not any(x["label"].startswith("Boolean mask") for x in subs))
-            sub["vals"] = _sub_slice(t, self.namer(list(t.shape), label, causal))
-            if ops and DETAIL["on"]:
-                sub["ops"] = ops
-        subs.append(sub)
-
-    def _diff_locals(self, frame) -> None:
-        prev = self.pending.get(frame)
-        if prev is None or not self.stack:
-            return
-        line, snap = prev
-        fname = PROJECT_FILES[frame.f_code.co_filename]
-        code = self.code_at(fname, line)
-        for name, val in frame.f_locals.items():
-            if isinstance(val, torch.Tensor) and snap.get(name) != id(val):
-                self.record_sub(val, fname, line, _label(code, name), var=name)
-
-    # ---- sys.settrace plumbing -------------------------------------------------
-    def global_trace(self, frame, event, arg):
-        if event == "call" and frame.f_code.co_filename in PROJECT_FILES:
-            return self.local_trace
-        return None
-
-    def local_trace(self, frame, event, arg):
-        if event in ("line", "return"):
-            self._diff_locals(frame)  # the previous line of this frame just finished
-        if event == "line":
-            if self.stack:
-                fname = PROJECT_FILES[frame.f_code.co_filename]
-                step = self.stack[-1]
-                step["exec"].setdefault(fname, set()).add(frame.f_lineno)
-                step["first"].setdefault(fname, frame.f_lineno)  # first line run, in time order
-            self.pending[frame] = (frame.f_lineno, {k: id(v) for k, v in frame.f_locals.items()
-                                                     if isinstance(v, torch.Tensor)})
-        elif event == "return":
-            prev = self.pending.pop(frame, None)
-            if prev and self.stack and isinstance(arg, torch.Tensor):
-                fname = PROJECT_FILES[frame.f_code.co_filename]
-                code = self.code_at(fname, prev[0])
-                self.record_sub(arg, fname, prev[0], _label(code, None), var="return")
-        return self.local_trace
-
-    def current_line(self) -> tuple[str | None, int | None]:
-        """Innermost project frame's current line (the code that triggered a PyTorch op)."""
-        f = sys._getframe(1)
-        while f is not None:
-            if f.f_code.co_filename in PROJECT_FILES:
-                return PROJECT_FILES[f.f_code.co_filename], f.f_lineno
-            f = f.f_back
-        return None, None
-
-    # ---- step boundaries -------------------------------------------------------
-    @staticmethod
-    def _project_frames() -> list[dict]:
-        frames = []
-        f = sys._getframe(2)
-        while f is not None:
-            if f.f_code.co_filename in PROJECT_FILES:
-                frames.append({
-                    "file": PROJECT_FILES[f.f_code.co_filename],
-                    "line": f.f_lineno,
-                    "func": getattr(f.f_code, "co_qualname", f.f_code.co_name),
-                })
-            f = f.f_back
-        return frames[::-1]  # outermost first
-
-    def begin(self, key: str, layer: int | None, inputs: list[tuple[str, object]], module=None) -> dict:
-        step = {
-            "key": key,
-            "layer": layer,
-            "_module": module,
-            "frames": self._project_frames(),
-            "exec": {},
-            "first": {},
-            # Labelled tensor inputs, e.g. [{"name": "query", "shape": [2, 7, 512], "dtype": "float32"}]
-            "inputs": [
-                {"name": n, "shape": list(x.shape), "dtype": str(x.dtype).replace("torch.", "")}
-                for n, x in inputs if isinstance(x, torch.Tensor)
-            ],
-        }
-        step["in_shapes"] = [i["shape"] for i in step["inputs"]]
-        # Inputs aren't operations: aliases of them (e.g. `key = query`) are skipped as sub-steps.
-        step["_seen"] = {id(x): x for _, x in inputs if isinstance(x, torch.Tensor)}
-        self.stack.append(step)
-        return step
-
-    def end(self, output) -> dict:
-        step = self.stack.pop()
-        self.steps.append(step)
-        return step
-
-
-def _layernorm_subs(tracer: Tracer, step: dict, mod, x: torch.Tensor, out: torch.Tensor) -> None:
-    """Decompose LayerNorm (computed in C++ by PyTorch) into its arithmetic, linked to the call site."""
-    call = step["frames"][-1] if step["frames"] else {"file": None, "line": None}
-    file, line = call["file"], call["line"]
-    tracer.stack.append(step)  # record into this (already finished) step
-    try:
-        if not step["key"].endswith("final"):
-            tracer.record_sub(x, file, line, "Residual add: x + Dropout(Sublayer(x))", var="x",
-                              formula="x + Sublayer(x)", force=True)
-        mu = x.mean(-1, keepdim=True)
-        var = x.var(-1, unbiased=False, keepdim=True)
-        xhat = (x - mu) / torch.sqrt(var + mod.eps)
-        tracer.record_sub(mu, file, line, "Mean over the features", var="μ", formula="μ = mean(x)")
-        tracer.record_sub(var, file, line, "Variance over the features", var="σ²", formula="σ² = mean((x − μ)²)")
-        tracer.record_sub(xhat, file, line, "Normalize", var="x̂", formula="x̂ = (x − μ) / √(σ² + ε)")
-        tracer.record_sub(out, file, line, "Scale and shift (learned γ, β)", var="y", formula="y = γ · x̂ + β",
-                          ops={"gamma": _rl(mod.weight.detach().tolist()), "beta": _rl(mod.bias.detach().tolist()),
-                               "eps": mod.eps})
-    finally:
-        tracer.stack.pop()
+_label = tr.make_labeler(LABEL_RULES)
 
 
 def simulate(settings, src_sentences=None, tgt_sentences=None, detail: bool = False, src_bos: bool = True) -> dict:
     """Run one traced forward pass with `settings` (the project modules are pointed at them)."""
-    DETAIL["on"] = detail
-    try:
-        with use_settings(settings):
-            return _simulate(settings, src_sentences or SRC_SENTENCES, tgt_sentences or TGT_SENTENCES, src_bos)
-    finally:
-        DETAIL["on"] = False
-
-
-def _definition_line(model, name: str) -> dict | None:
-    """Where a PyTorch layer is defined in the project (`self.q_proj = nn.Linear(...)`, or the
-    k-th entry of an `nn.Sequential(...)`), so the code panel can show it next to the call site."""
-    parts = name.split(".")
-    owner_path, attr, seq_index = parts[:-1], parts[-1], None
-    if attr.isdigit():                                  # an element of an nn.Sequential
-        seq_index, attr = int(attr), owner_path[-1]
-        owner_path = owner_path[:-1]
-    owner = model.get_submodule(".".join(owner_path)) if owner_path else model
-    try:
-        src, start = inspect.getsourcelines(type(owner))
-        file = PROJECT_FILES.get(str(Path(inspect.getsourcefile(type(owner))).resolve()))
-    except (OSError, TypeError):
-        return None
-    if not file:
-        return None
-    for i, line in enumerate(src):
-        if re.search(rf"self\.{re.escape(attr)}\s*=", line):
-            if seq_index is None:
-                return {"file": file, "line": start + i}
-            # count the elements inside nn.Sequential( ... )
-            k = -1
-            for j in range(i + 1, len(src)):
-                text = src[j].strip()
-                if not text or text.startswith(")"):
-                    break
-                k += 1
-                if k == seq_index:
-                    return {"file": file, "line": start + j}
-    return None
+    with tr.detail_mode(detail), tr.use_settings(settings, SETTINGS_MODULES):
+        return _simulate(settings, src_sentences or SRC_SENTENCES, tgt_sentences or TGT_SENTENCES, src_bos)
 
 
 def _simulate(settings, SRC_SENTENCES, TGT_SENTENCES, src_bos: bool = True) -> dict:
@@ -440,77 +117,26 @@ def _simulate(settings, SRC_SENTENCES, TGT_SENTENCES, src_bos: bool = True) -> d
     src, tgt = torch.tensor(src_ids), torch.tensor(tgt_ids)
 
     model = Transformer().eval()  # eval(): dropout disabled, so the trace is deterministic
-    namer = DimNamer(src.size(0), src.size(1), tgt.size(1), m.d_model, m.d_ff, m.n_heads, m.tgt_vocab_size)
-    tracer = Tracer(namer)
-
-    # Leaf PyTorch layers (Linear, Embedding, activations) become sub-steps of the running step.
-    names = {mod: n for n, mod in model.named_modules()}
-
-    def leaf_hook(mod, inp, out):
-        if not tracer.stack or mod is tracer.stack[-1].get("_module"):
-            return
-        if isinstance(mod, (torch.nn.Dropout, torch.nn.LayerNorm)):
-            return  # dropout is the identity in eval mode; LayerNorm steps are decomposed below
-        file, line = tracer.current_line()
-        attr = names[mod].split(".")[-1]
-        attr = f"net[{attr}]" if attr.isdigit() else attr
-        ops = None
-        if isinstance(mod, torch.nn.Linear):
-            label, formula = f"Linear {attr}: {mod.in_features} → {mod.out_features}", "x · Wᵀ + b"
-            if DETAIL["on"]:   # operands for the cell-by-cell matmul view
-                ops = {"x": _rl(inp[0].detach().float().tolist()), "W": _rl(mod.weight.detach().tolist()),
-                       "b": _rl(mod.bias.detach().tolist()) if mod.bias is not None else None}
-        elif isinstance(mod, torch.nn.Embedding):
-            label, formula = "Embedding lookup: one table row per token id", "E[token]"
-            if DETAIL["on"]:
-                used = sorted({int(i) for i in inp[0].flatten().tolist()})
-                ops = {"rows": {str(i): _rl(mod.weight[i].detach().tolist()) for i in used}}
-        else:
-            label, formula = f"{type(mod).__name__} activation", f"{type(mod).__name__.lower()}(x)"
-            if DETAIL["on"]:
-                ops = {"x": _rl(inp[0].detach().float().tolist())}
-        tracer.record_sub(out, file, line, label, var=attr, formula=formula, ops=ops)
-        if tracer.stack and tracer.stack[-1].get("subs") and tracer.stack[-1]["subs"][-1]["label"] == label:
-            d = _definition_line(model, names[mod])
-            if d:
-                tracer.stack[-1]["subs"][-1]["def"] = d
-
-    for mod in model.modules():
-        if not list(mod.children()):
-            mod.register_forward_hook(leaf_hook)
+    namer = DimNamer(src.size(0), [src.size(1), tgt.size(1)], m.d_model, m.d_ff, m.n_heads, m.tgt_vocab_size)
+    tracer = Tracer(ROOT, namer, _label)
+    tr.install_leaf_hooks(tracer, model)
     pe_calls = {"n": 0}
-    extras: dict[int, dict] = {}  # id(step) -> extra payload
 
     # ---- forward hooks on the modules that correspond to diagram blocks ---------
+    def pe_key(mod):                                     # one PositionalEncoding serves both sides
+        pe_calls["n"] += 1
+        return "pe_enc" if pe_calls["n"] == 1 else "pe_dec"
+
+    def on_post(step, mod, args, output):
+        out = output[0] if isinstance(output, tuple) else output
+        if isinstance(mod, torch.nn.LayerNorm):
+            tr.layernorm_subs(tracer, step, mod, args[0], out, post_norm=True)
+        if isinstance(output, tuple) and len(output) > 1:
+            # attention weights (B, H, T, S) -> average over heads per sample
+            step["attn"] = output[1].mean(dim=1).round(decimals=3).tolist()
+
     def hook(module, key, layer=None):
-        def pre(mod, args, kwargs):
-            k = key
-            if key == "pe":
-                k = "pe_enc" if pe_calls["n"] == 0 else "pe_dec"
-                pe_calls["n"] += 1
-            names = [p for p in inspect.signature(mod.forward).parameters]
-            named = list(zip(names, args)) + list(kwargs.items())
-            step = tracer.begin(k, layer, named, module=mod)
-            first = next((t for _, t in named if isinstance(t, torch.Tensor)), None)
-            step["in_vals"] = _cube_slice(first)
-
-        def post(mod, args, kwargs, output):
-            step = tracer.end(output)
-            out = output[0] if isinstance(output, tuple) else output
-            step["out_shape"] = _shape(out)
-            step["out_dtype"] = str(out.dtype).replace("torch.", "")
-            step["out_vals"] = _cube_slice(out)
-            if DETAIL["on"] and isinstance(mod, torch.nn.Linear):   # e.g. the generator: operands for the matmul view
-                step["ops"] = {"x": _rl(args[0].detach().float().tolist()), "W": _rl(mod.weight.detach().tolist()),
-                               "b": _rl(mod.bias.detach().tolist()) if mod.bias is not None else None}
-            if isinstance(mod, torch.nn.LayerNorm):
-                _layernorm_subs(tracer, step, mod, args[0], out)
-            if isinstance(output, tuple) and len(output) > 1:
-                # attention weights (B, H, T, S) -> average over heads per sample
-                step["attn"] = output[1].mean(dim=1).round(decimals=3).tolist()
-
-        module.register_forward_pre_hook(pre, with_kwargs=True)
-        module.register_forward_hook(post, with_kwargs=True)
+        tracer.hook(module, pe_key if key == "pe" else key, layer, on_post)
 
     hook(model.input_embedding, "input_embedding")
     hook(model.positional_encoding, "pe")
@@ -592,39 +218,15 @@ def _simulate(settings, SRC_SENTENCES, TGT_SENTENCES, src_bos: bool = True) -> d
         "key": "softmax", "layer": None, "frames": [], "exec": {},
         "inputs": [{"name": "logits", "shape": list(logits.shape), "dtype": "float32"}],
         "in_shapes": [list(logits.shape)], "out_shape": list(probs.shape), "out_dtype": "float32",
-        "topk": topk, "in_vals": _cube_slice(logits), "out_vals": _cube_slice(probs),
+        "topk": topk, "in_vals": cube_slice(logits), "out_vals": cube_slice(probs),
     })
 
     # ---- finalize: titles, descriptions, primary file ---------------------------
     d, h, V = m.d_model, m.n_heads, m.tgt_vocab_size
     nE, nD = m.n_encoder_layers, m.n_decoder_layers
-    out = []
-    for s in tracer.steps:
-        block, comp, role = STEP_MAP[s["key"]]
-        ins = s.get("in_shapes") or [[]]
-        o = s.get("out_shape") or []
-        L = s["layer"]
-        title, desc = _describe(s["key"], L, nE, nD, ins, o, d, h, m, tok, V)
-        exec_ = {f: sorted(v) for f, v in s["exec"].items()}
-        if exec_:
-            primary = max(exec_, key=lambda f: len(exec_[f]))
-        elif s["frames"]:
-            primary = s["frames"][-1]["file"]
-            exec_ = {primary: [s["frames"][-1]["line"]]}  # e.g. LayerNorm: show the call site
-        else:
-            primary = None
-        step = {
-            "key": s["key"], "block": block, "comp": comp, "role": role,
-            "layer": L, "nlayers": nE if s["key"].startswith("enc") else nD if s["key"].startswith("dec") else None,
-            "title": title, "desc": desc, "frames": s["frames"], "exec": exec_, "primary": primary,
-            "first": s.get("first", {}),
-            "inputs": s.get("inputs", []) + s.get("scalar_inputs", []),
-            "out_shape": o, "out_dtype": s.get("out_dtype"),
-        }
-        for k in ("attn", "mask", "topk", "topk_logits", "in_vals", "out_vals", "subs", "ops"):
-            if k in s:
-                step[k] = s[k]
-        out.append(step)
+    out = tr.finalize(tracer.steps, STEP_MAP,
+                      lambda key, L, ins, o: _describe(key, L, nE, nD, ins, o, d, h, m, tok, V),
+                      lambda key: nE if key.startswith("enc") else nD if key.startswith("dec") else None)
 
     return {
         "batch": {

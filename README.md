@@ -20,10 +20,12 @@ forward pass**. Every operation is drawn as isometric tensors holding the actual
 written out in LaTeX and checked against what the model computed, and the exact line of code that ran it is
 outlined beside it.
 
-One folder per architecture, each with its own model code, visualization and demo material.
+One folder per architecture, each with its own model code, visualization and demo material. The page
+shell, the tracer and the shared tensor views live in [`shared/`](shared/), so every model is drawn the same way.
 
 - [Models](#models)
 - [Quickstart](#quickstart)
+- [Repository layout](#repository-layout)
 - [License](#license)
 
 ## Models
@@ -31,21 +33,35 @@ One folder per architecture, each with its own model code, visualization and dem
 | Model | Status | Folder |
 | --- | --- | --- |
 | Encoder–decoder — the original Transformer, *Attention Is All You Need* | ✅ available | [`encoder-decoder/`](encoder-decoder/) |
+| Vision Transformer (ViT), encoder-only — *An Image Is Worth 16x16 Words* | ✅ available | [`ViT/`](ViT/) |
 | Decoder-only — GPT-style | planned | — |
 | Encoder-only — BERT-style | planned | — |
 
 ![The encoder–decoder visualization: the Operation panel, the architecture diagram and the code, following the same step](encoder-decoder/demo/screenshots/01-overview.png)
 
+![The ViT visualization: the Conv2d patch projection worked out as a matrix multiplication, beside the diagram and the code](ViT/demo/screenshots/04-conv-matmul.png)
+
 ## Quickstart
 
 ```bash
-cd encoder-decoder
+cd encoder-decoder      # or: cd ViT
 uv sync
 uv run ui/serve.py
 ```
 
-The [encoder–decoder README](encoder-decoder/README.md) has the demo, every feature, how the page is generated,
-and how to regenerate the walkthrough and carousel.
+Each model's README has its demo, every feature, how the page is generated, and how to regenerate the
+walkthrough and carousel: [encoder–decoder](encoder-decoder/README.md) · [ViT](ViT/README.md).
+
+## Repository layout
+
+```
+TransformersVisualizations/
+├── shared/                 # used by every model
+│   ├── py/                 # tracer.py (hooks, settrace, glue lines) · build.py · serve.py · capture.py · paper_pdf.py
+│   └── ui/                 # template.html · js/dock.js · js/tensors.js · js/stage-core.js
+├── encoder-decoder/        # model, ui/ (simulate, presets, notes, model.js, stage-model.js), demo/
+└── ViT/                    # model, ui/ (simulate, presets, notes, model.js, stage-model.js), demo/
+```
 
 ## License
 

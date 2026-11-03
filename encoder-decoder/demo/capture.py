@@ -9,24 +9,16 @@ Usage (from encoder-decoder/):
     uv run ui/build_ui.py          # make sure the page is up to date
     uv run demo/capture.py         # needs google-chrome and ffmpeg on PATH
 
-The paper's page viewer is deliberately not captured: full pages of the paper go beyond
+The shared machinery is in shared/py/capture.py. The paper's page viewer is deliberately not captured: full pages of the paper go beyond
 the tables-and-figures permission, so they stay out of public demo material.
 """
 
-import functools
-import http.server
-import shutil
-import subprocess
-import tempfile
-import threading
+import sys
 from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
-UI = DEMO.parent / "ui"
-SHOTS = DEMO / "screenshots"
-CARDS = DEMO / "cards"
-W, H = 1920, 1080
-FONT = "/usr/share/fonts/liberation-sans-fonts/LiberationSans-Bold.ttf"
+sys.path.insert(0, str(DEMO.parent.parent / "shared" / "py"))
+import capture  # noqa: E402  (shared/py/capture.py)
 
 # (file name, query string, step, caption)
 SHOTS_SPEC = [
@@ -45,89 +37,5 @@ SHOTS_SPEC = [
 ]
 
 
-def serve(directory: Path) -> tuple[http.server.ThreadingHTTPServer, int]:
-    class Quiet(http.server.SimpleHTTPRequestHandler):
-        def log_message(self, *args):  # keep the capture output readable
-            pass
-    handler = functools.partial(Quiet, directory=str(directory))
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, server.server_address[1]
-
-
-def chrome(*args: str) -> None:
-    exe = shutil.which("google-chrome") or shutil.which("chromium")
-    if not exe:
-        raise SystemExit("google-chrome (or chromium) is required")
-    with tempfile.TemporaryDirectory() as profile:     # fresh profile: default layout, no saved state
-        subprocess.run([exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--no-first-run",
-                        f"--user-data-dir={profile}", *args], check=True, capture_output=True)
-
-
-def screenshot(url: str, out: Path, w: int = W, h: int = H, wait_ms: int = 9000) -> None:
-    chrome(f"--window-size={w},{h}", f"--virtual-time-budget={wait_ms}", f"--screenshot={out}", url)
-    print(f"  {out.relative_to(DEMO)}")
-
-
-def main() -> None:
-    SHOTS.mkdir(exist_ok=True)
-    server, port = serve(DEMO.parent)                  # serve encoder-decoder/ so ui/ and demo/ are reachable
-    base = f"http://127.0.0.1:{port}"
-    try:
-        print("Screenshots:")
-        for name, query, step, _ in SHOTS_SPEC:
-            screenshot(f"{base}/ui/architecture.html?{query}&theme=dark#s={step}", SHOTS / f"{name}.png")
-        print("Cards:")
-        for card in ("intro", "outro"):
-            screenshot(f"{base}/demo/cards/{card}.html", CARDS / f"{card}.png", wait_ms=2000)
-        print("Carousel:")
-        chrome("--no-pdf-header-footer", f"--print-to-pdf={DEMO / 'linkedin-carousel.pdf'}", "--virtual-time-budget=4000",
-               f"{base}/demo/carousel.html")
-        print("  linkedin-carousel.pdf")
-    finally:
-        server.shutdown()
-    make_video()
-
-
-def make_video(seconds: float = 4.2, fade: float = 0.6) -> None:
-    """Captioned slideshow: intro card → feature screenshots → outro card, with crossfades."""
-    if not shutil.which("ffmpeg"):
-        raise SystemExit("ffmpeg is required for the video")
-    frames = [(CARDS / "intro.png", None)] + [(SHOTS / f"{n}.png", c) for n, _, _, c in SHOTS_SPEC] + [(CARDS / "outro.png", None)]
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        clips = []
-        for k, (img, caption) in enumerate(frames):
-            clip = tmp / f"c{k:02d}.mp4"
-            vf = f"scale={W}:{H},format=yuv420p"
-            if caption:
-                cap = tmp / f"cap{k:02d}.txt"
-                cap.write_text(caption, encoding="utf-8")
-                vf += (f",drawbox=x=0:y=ih-110:w=iw:h=110:color=black@0.72:t=fill,"
-                       f"drawtext=fontfile={FONT}:textfile={cap}:fontcolor=white:fontsize=40:x=(w-text_w)/2:y=h-75")
-            dur = seconds + (1.2 if caption is None else 0)
-            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-loop", "1", "-t", f"{dur}", "-i", str(img),
-                            "-vf", vf, "-r", "30", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip)], check=True)
-            clips.append((clip, dur))
-        # chain crossfades
-        inputs, filt, last, offset = [], [], "[0:v]", 0.0
-        for k, (clip, dur) in enumerate(clips):
-            inputs += ["-i", str(clip)]
-            if k == 0:
-                offset = dur - fade
-                continue
-            out = f"[v{k}]"
-            filt.append(f"{last}[{k}:v]xfade=transition=fade:duration={fade}:offset={offset:.2f}{out}")
-            last, offset = out, offset + dur - fade
-        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs, "-filter_complex", ";".join(filt), "-map", last,
-                        "-c:v", "libx264", "-crf", "20", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                        str(DEMO / "walkthrough.mp4")], check=True)
-    # GIF for the README (GitHub plays GIFs inline, not MP4s)
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(DEMO / "walkthrough.mp4"), "-vf",
-                    "fps=6,scale=1100:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=160[p];[b][p]paletteuse=dither=sierra2_4a",
-                    str(DEMO / "walkthrough.gif")], check=True)
-    print("Video:\n  walkthrough.mp4\n  walkthrough.gif")
-
-
 if __name__ == "__main__":
-    main()
+    capture.run(DEMO, SHOTS_SPEC)
