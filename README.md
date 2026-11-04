@@ -46,7 +46,7 @@ shell, the tracer and the shared tensor views live in [`shared/`](shared/), so e
 ```bash
 cd encoder-decoder      # or: cd ViT
 uv sync
-uv run ui/serve.py
+uv run ui/serve.py      # opens http://127.0.0.1:8765/architecture.html
 ```
 
 Each model's README has its demo, every feature, how the page is generated, and how to regenerate the

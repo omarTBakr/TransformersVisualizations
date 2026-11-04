@@ -93,7 +93,17 @@ uv sync                 # torch, pydantic, pyyaml
 uv run ui/serve.py      # builds the page, serves it on localhost, opens the browser
 ```
 
-`ui/build_ui.py` alone writes `ui/architecture.html`, which also opens straight from disk, with no server.
+`serve.py` rebuilds the page, serves `ui/` and opens **http://127.0.0.1:8765/architecture.html** in your
+browser. Stop it with Ctrl+C.
+
+| Option | What it does |
+|---|---|
+| `--no-build` | serve the existing `architecture.html` without rebuilding it |
+| `--no-open` | start the server without opening a browser |
+| `--port 9000` | use another port (if it is busy, the next nine are tried) |
+
+The server is there so the Paper panel can load your local copy of the PDF (put it in `ui/`; it is git-ignored).
+Without it, `uv run ui/build_ui.py` writes `ui/architecture.html`, which also opens straight from disk.
 If uv cannot create its cache directory, point it somewhere writable: `UV_CACHE_DIR=~/.cache/uv uv run ui/serve.py`.
 
 The model runs on its own, too:
